@@ -38,6 +38,16 @@ def _core(config: Optional[str] = None) -> GovernanceCore:
     return GovernanceCore(load_config(config))
 
 
+def _names(core: GovernanceCore) -> dict[str, str]:
+    """Repository id -> owner/name. Tables show names; ids are for machines."""
+    return {
+        row["id"]: row["full_name"]
+        for row in core.conn.execute(
+            "SELECT id, full_name FROM repositories WHERE tenant_id = ?", (core.tenant_id,)
+        )
+    }
+
+
 # --------------------------------------------------------------------------
 # diagnostics
 # --------------------------------------------------------------------------
@@ -140,17 +150,30 @@ def matrix(
         if limit:
             rows = rows[:limit]
         table = Table(title=f"Repository Matrix ({len(rows)})")
-        for column in ("Repo", "Category", "Lifecycle", "Origin", "Contribution", "Risk", "Agent"):
+        for column in (
+            "Repo",
+            "Category",
+            "Lifecycle",
+            "Origin",
+            "Contribution",
+            "Crit",
+            "Agent",
+            "Review",
+        ):
             table.add_column(column, overflow="fold")
         for row in rows:
+            # `repo` is owner/name; strip the owner, which is identical for every row
+            # in a single-account tenant and just eats width.
+            name = str(row.get("repo", "")).split("/", 1)[-1]
             table.add_row(
-                str(row.get("repository", "")),
+                name,
                 str(row.get("category", "")),
                 str(row.get("lifecycle", "")),
-                str(row.get("origin", "")),
+                str(row.get("origin", "")).replace("ORIGINAL_WITH_DEPENDENCIES", "ORIGINAL+DEPS"),
                 str(row.get("contribution", "")),
                 str(row.get("risk", "")),
-                str(row.get("agent_access", "")),
+                str(row.get("agent_mode", "")),
+                str(row.get("review_status", "")),
             )
         console.print(table)
     finally:
@@ -186,14 +209,16 @@ def origin(
             engine.save(profile)
             profiles = [profile]
 
+        names = _names(core)
         table = Table(title=f"Origin verdicts ({len(profiles)})")
-        for column in ("Repository", "Origin", "Confidence", "Contribution", "Review"):
+        for column in ("Repository", "Origin", "Conf", "Depth", "Contribution", "Review"):
             table.add_column(column, overflow="fold")
         for p in profiles:
             table.add_row(
-                p.repository_id,
+                names.get(p.repository_id, p.repository_id),
                 str(p.origin_type),
                 f"{p.origin_confidence:.2f}",
+                p.analysis_depth,
                 str(p.contribution.band),
                 str(p.review_status),
             )
@@ -217,14 +242,19 @@ def review_list(config: Optional[str] = typer.Option(None, "--config", "-c")) ->
             console.print("[green]review queue is empty[/green]")
             return
         table = Table(title=f"Provenance review queue ({len(queue)})")
-        for column in ("Repository", "Origin", "Confidence", "Why"):
-            table.add_column(column, overflow="fold")
+        for column, style in (
+            ("Repository", None),
+            ("Origin", None),
+            ("Conf", "right"),
+            ("Why it needs a human", None),
+        ):
+            table.add_column(column, justify=style or "left", overflow="fold")
         for item in queue:
             table.add_row(
-                str(item.get("full_name", item.get("repository_id", ""))),
+                str(item.get("full_name") or item.get("repository_id", "")),
                 str(item.get("origin_type", "")),
-                f"{float(item.get('origin_confidence', 0)):.2f}",
-                str(item.get("reason", "")),
+                f"{float(item.get('confidence', 0.0)):.2f}",
+                "; ".join(item.get("reasons", []))[:110],
             )
         console.print(table)
     finally:
@@ -323,12 +353,13 @@ def classify(
         for result in results:
             classifier.save(result, apply_to_repository=apply)
 
+        names = _names(core)
         table = Table(title=f"Classification ({len(results)}{'  applied' if apply else '  proposal'})")
         for column in ("Repository", "Category", "Lifecycle", "Maturity", "Crit", "Agent", "Conf"):
             table.add_column(column, overflow="fold")
         for r in results:
             table.add_row(
-                r.repository_id,
+                names.get(r.repository_id, r.repository_id),
                 str(r.category),
                 str(r.lifecycle),
                 str(r.maturity),

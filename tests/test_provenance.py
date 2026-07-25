@@ -901,3 +901,43 @@ def test_analysis_never_opens_a_writable_scope(core: GovernanceCore) -> None:
     assert core.cfg.governance.read_only is True
     with pytest.raises(PermissionError):
         core.client(TokenScope.WRITE_METADATA, reason="should be refused")
+
+
+class TestLicenceProseIsNotAnEmbeddedLicence:
+    """A page *about* licensing governs no code and must not trigger legal review.
+
+    Caught on the live portfolio: an ``ai/governance/license.md`` page (an AI-rights
+    declaration, entirely the author's own writing) sent two flagship repositories to
+    LEGAL_REVIEW_REQUIRED because the detector treated any non-root licence file as
+    embedded third-party material.
+    """
+
+    @staticmethod
+    def _paths(paths: list[str]):
+        from eveaegis.provenance.components import classify_paths
+
+        return classify_paths([{"path": p, "type": "blob", "size": 100} for p in paths])
+
+    def test_licence_prose_with_no_adjacent_code_is_not_embedded(self) -> None:
+        summary = self._paths(
+            ["README.md", "LICENSE", "src/main.py", "ai/governance/license.md"]
+        )
+        assert summary.embedded_license_files == []
+        # Ruled out, not discarded — a human can still see what was considered.
+        assert summary.documentary_license_files == ["ai/governance/license.md"]
+
+    def test_licence_beside_code_is_still_embedded(self) -> None:
+        summary = self._paths(
+            ["LICENSE", "packages/upstream-lib/LICENSE", "packages/upstream-lib/index.ts"]
+        )
+        assert summary.embedded_license_files == ["packages/upstream-lib/LICENSE"]
+
+    def test_vendored_licence_is_kept_even_without_detected_code(self) -> None:
+        """Inside vendor/ the signal stands on its own — that is where copyleft hides."""
+        summary = self._paths(["LICENSE", "vendor/core/LICENSE"])
+        assert summary.embedded_license_files == ["vendor/core/LICENSE"]
+
+    def test_root_licence_is_never_embedded(self) -> None:
+        summary = self._paths(["LICENSE", "src/main.py"])
+        assert summary.embedded_license_files == []
+        assert summary.license_files == ["LICENSE"]

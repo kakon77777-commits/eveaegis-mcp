@@ -259,6 +259,9 @@ class ComponentSummary:
     license_files: list[str] = field(default_factory=list)
     attribution_files: list[str] = field(default_factory=list)
     embedded_license_files: list[str] = field(default_factory=list)
+    #: Nested licence files that govern no code — documentation *about* licensing.
+    #: Kept visible rather than discarded, so a human can see what was ruled out.
+    documentary_license_files: list[str] = field(default_factory=list)
     submodule_declared: bool = False
 
     # -- ratios ---------------------------------------------------------
@@ -482,7 +485,44 @@ def classify_paths(
         _record_special_file(summary, path, component_class)
 
     summary.excluded_roots = sorted(excluded_roots)
+    _prune_non_governing_licenses(summary)
     return summary
+
+
+def _prune_non_governing_licenses(summary: ComponentSummary) -> None:
+    """Drop nested licence files that do not actually govern any code.
+
+    A licence file below the root is a §10 signal because it usually means somebody
+    else's source is sitting next to it. Prose *about* licensing is not that: a
+    ``docs/legal/license.md`` or an ``ai/governance/license.md`` page governs no
+    code, and flagging it as an embedded third-party licence sends a clean
+    repository to legal review for writing documentation.
+
+    So the rule is narrowed: keep a nested licence unconditionally when it is inside
+    a dependency/vendored/generated root, and otherwise only when its own directory
+    subtree actually contains source code for it to govern.
+    """
+    if not summary.embedded_license_files:
+        return
+
+    code_dirs = {
+        posixpath.dirname(f.path)
+        for f in summary.files
+        if f.dimension == ContributionDimension.CODE
+    }
+
+    def governs_code(path: str) -> bool:
+        directory = posixpath.dirname(path)
+        if any(d in DEPENDENCY_DIRS or d in VENDORED_DIRS or d in GENERATED_DIRS
+               for d in directory.lower().split("/")):
+            return True
+        return any(d == directory or d.startswith(f"{directory}/") for d in code_dirs)
+
+    kept, dropped = [], []
+    for path in summary.embedded_license_files:
+        (kept if governs_code(path) else dropped).append(path)
+    summary.embedded_license_files = kept
+    summary.documentary_license_files = dropped
 
 
 def _record_special_file(summary: ComponentSummary, path: str, component_class: ComponentClass) -> None:
