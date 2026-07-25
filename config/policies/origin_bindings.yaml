@@ -1,0 +1,149 @@
+# §12 來源類型綁定政策 — origin-type binding policy.
+#
+# The `policies:` block below is the whitepaper's §12 listing verbatim: same ids,
+# same `when` / `allow` / `deny` / `require` keys, same order. Do not "improve" it
+# — it is the normative text, and the diff against the whitepaper is what makes it
+# auditable.
+#
+# `capabilities:` is the translation layer this implementation adds: §12 speaks in
+# capability names, MCP speaks in tool names (§13). Nothing here grants a
+# capability that §12 did not list.
+
+schema_version: "0.1"
+profile: origin-bindings
+
+policies:
+  - id: original-project-default
+    when:
+      origin_type:
+        - ORIGINAL
+        - ORIGINAL_WITH_DEPENDENCIES
+    allow:
+      - metadata_write
+      - documentation_pr
+      - controlled_code_write
+
+  - id: fork-policy
+    when:
+      origin_type:
+        - GITHUB_FORK
+        - DETACHED_FORK
+        - DERIVATIVE_PROJECT
+    allow:
+      - upstream_sync
+      - local_patch_pr
+      - documentation_pr
+    require:
+      - preserve_attribution
+      - license_review
+
+  - id: mirror-policy
+    when:
+      origin_type: MIRROR
+    allow:
+      - sync
+      - read
+    deny:
+      - autonomous_rewrite
+      - public_originality_claim
+
+  - id: unknown-origin-policy
+    when:
+      origin_type: UNKNOWN
+    allow:
+      - read
+      - analyze
+      - create_review_issue
+    deny:
+      - license_change
+      - public_originality_claim
+      - repository_transfer
+      - archive_without_review
+
+# --------------------------------------------------------------------------
+# Origin types §12 does not name explicitly. Each is bound to the nearest listed
+# policy rather than left unbound, because "unbound" would mean "unconstrained".
+# --------------------------------------------------------------------------
+fallback_bindings:
+  TEMPLATE_DERIVED: fork-policy
+  PLUGIN_OR_EXTENSION: fork-policy
+  UPSTREAM_IMPORT: fork-policy
+  MULTI_SOURCE_COMPOSITE: fork-policy
+  VENDOR_SNAPSHOT: mirror-policy
+  GENERATED_PROJECT: original-project-default
+
+# Applied when no origin profile exists at all — Phase 2 has not run for this
+# repository. Not analysed is not the same as clean.
+default_policy_id: unknown-origin-policy
+
+# --------------------------------------------------------------------------
+# capability → the §13 tools that exercise it.
+# --------------------------------------------------------------------------
+capabilities:
+  read:
+    - inventory_accounts
+    - inventory_repositories
+    - refresh_repository
+    - get_portfolio_summary
+    - find_unclassified_repositories
+    - preview_change_plan
+    - generate_provenance_report
+  analyze:
+    - analyze_repository_origin
+    - compare_repository_lineage
+    - find_candidate_upstreams
+    - estimate_local_contribution
+    - classify_repository
+    - classify_portfolio
+    - propose_lifecycle
+    - propose_repository_category
+    - detect_archive_candidates
+    - detect_superseded_projects
+    - evaluate_action_policy
+    - create_change_plan
+  create_review_issue:
+    - review_provenance_decision
+  metadata_write:
+    - propose_repository_metadata
+    - apply_repository_taxonomy
+    - standardize_topics
+    - standardize_descriptions
+    - generate_project_catalog
+  documentation_pr:
+    - propose_readme_update
+    - create_documentation_branch
+    - create_documentation_pr
+    - add_origin_notice
+    - add_superseded_notice
+  local_patch_pr:
+    - create_documentation_branch
+    - create_documentation_pr
+  controlled_code_write:
+    - execute_approved_plan
+    - rollback_change_plan
+  upstream_sync: []
+  sync: []
+  # Denied capabilities map to the tools that would exercise them.
+  autonomous_rewrite:
+    - execute_approved_plan
+    - rollback_change_plan
+    - standardize_descriptions
+  public_originality_claim:
+    - generate_project_catalog
+    - standardize_descriptions
+    - propose_repository_metadata
+    - apply_repository_taxonomy
+  license_change: []
+  repository_transfer:
+    - transfer_repository
+  archive_without_review:
+    - archive_repository
+
+# Requirements §12 attaches to a policy, surfaced on the decision so the executor
+# and the Policy Center (§19.4) can both see them.
+requirement_descriptions:
+  preserve_attribution: >-
+    Upstream attribution must survive the change; the executor must refuse a diff
+    that removes a NOTICE, LICENSE or origin header.
+  license_review: >-
+    A human must clear the licence question before this change is applied (§10).

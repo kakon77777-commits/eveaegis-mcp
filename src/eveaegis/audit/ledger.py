@@ -23,7 +23,13 @@ GENESIS = "0" * 64
 
 
 def canonical_dumps(value: Any) -> str:
-    """Order-independent JSON, so the same logical payload always hashes alike."""
+    """Order-independent JSON, so the same logical payload always hashes alike.
+
+    This serialization is **frozen**. Changing it silently invalidates every event
+    already on the chain: :meth:`AuditLedger.verify` will report the oldest events
+    as tampered even though nothing touched them. If it ever has to change, add a
+    per-row format column and dispatch on it — do not edit this function in place.
+    """
     return json.dumps(
         value, ensure_ascii=False, sort_keys=True, separators=(",", ":"), default=_json_default
     )

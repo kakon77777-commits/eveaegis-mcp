@@ -1,0 +1,264 @@
+# EveAegis core policy (whitepaper §11 RBAC/ABAC, §11.3 levels, §15 risk & decisions).
+#
+# This file is data, not a suggestion: the engine reads it on every evaluation.
+# Two properties must survive any edit here —
+#
+#   * fail closed: a tool absent from `tools.levels` is treated as L5_BREAK_GLASS,
+#     which the engine hard-codes. Deleting an entry restricts, never widens.
+#   * axiom 2: nothing in this file can raise a principal above its own
+#     `max_permission_level`. Every rule below can only *lower* a ceiling.
+
+schema_version: "0.1"
+profile: core
+
+# --------------------------------------------------------------------------
+# §11.1 RBAC — the highest level a role may ever reach.
+# --------------------------------------------------------------------------
+rbac:
+  role_max_level:
+    OWNER: L5_BREAK_GLASS
+    ADMIN: L4_REPOSITORY_ADMIN
+    MAINTAINER: L3_CONTROLLED_CODE_WRITE
+    PORTFOLIO_MANAGER: L2_CONTENT_PROPOSAL
+    DEVELOPER: L2_CONTENT_PROPOSAL
+    REVIEWER: L0_INVENTORY
+    AGENT: L0_INVENTORY
+    VIEWER: L0_INVENTORY
+  # A principal with no recognised role is not a principal with every role.
+  unknown_role_level: L0_INVENTORY
+
+# --------------------------------------------------------------------------
+# §11.2 ABAC — attribute rules. Each rule may lower the ceiling, demand approval,
+# attach a requirement, or forbid specific tools. `when` matches ALL listed
+# attributes; an attribute the engine could not resolve never matches.
+#
+# Resolvable attributes: tenant, actor_type, role, tool, category, lifecycle,
+# maturity, criticality, visibility, origin_type, license_status, agent_access.
+# --------------------------------------------------------------------------
+abac:
+  rules:
+    - id: archived-repository-freeze
+      description: An archived repository is a historical record; nothing writes to it.
+      when:
+        lifecycle: [ARCHIVED]
+      max_level: L0_INVENTORY
+
+    - id: superseded-repository-hold
+      description: >-
+        A superseded repository may still receive its superseded notice, but
+        nothing beyond documentation.
+      when:
+        lifecycle: [SUPERSEDED]
+      max_level: L2_CONTENT_PROPOSAL
+
+    - id: unclassified-repository-hold
+      description: >-
+        Classification has not run, or landed on UNKNOWN. Metadata governance on an
+        unclassified repository would be a guess written to a public surface.
+      when:
+        lifecycle: [UNKNOWN]
+      max_level: L0_INVENTORY
+
+    - id: critical-repository-guard
+      description: Breaking a CRITICAL asset is never worth an autonomous direct write.
+      when:
+        criticality: [CRITICAL]
+      max_level: L2_CONTENT_PROPOSAL
+      require_approval: true
+
+    - id: high-criticality-approval
+      description: HIGH criticality still writes, but never without a human.
+      when:
+        criticality: [HIGH]
+      require_approval: true
+
+    - id: public-repository-safety
+      description: >-
+        Anything written to a public repository is published. Agents propose;
+        humans publish.
+      when:
+        visibility: [public]
+        actor_type: [agent]
+      max_level: L2_CONTENT_PROPOSAL
+      require_approval: true
+
+    - id: license-review-hold
+      description: >-
+        §10 — an unresolved licence question blocks content writes until a human
+        clears it. Advisory, never a legal conclusion (§25).
+      when:
+        license_status: [REVIEW_REQUIRED, INCOMPATIBLE, COPYLEFT_TRIGGERED]
+      max_level: L1_METADATA_WRITE
+      require: [license_review]
+
+    - id: unknown-origin-restraint
+      description: >-
+        Axiom 4 — an unanalysed or unknown origin restricts the portfolio to
+        reading, analysing and raising review issues (§12 unknown-origin-policy).
+      when:
+        origin_type: [UNKNOWN]
+      max_level: L0_INVENTORY
+
+    - id: agent-write-ceiling
+      description: >-
+        No agent reaches repository administration through a tool call. §13.7 is
+        not exposed to general agents.
+      when:
+        actor_type: [agent]
+      max_level: L3_CONTROLLED_CODE_WRITE
+      deny_tools:
+        - delete_repository
+        - transfer_repository
+        - change_visibility
+        - modify_collaborators
+        - modify_ruleset
+
+# --------------------------------------------------------------------------
+# §13 tool → permission level. Every tool named in §13.1-§13.7 appears here.
+# A tool NOT listed resolves to L5_BREAK_GLASS in code — fail closed.
+# --------------------------------------------------------------------------
+tools:
+  levels:
+    # §13.1 Inventory
+    inventory_accounts: L0_INVENTORY
+    inventory_repositories: L0_INVENTORY
+    refresh_repository: L0_INVENTORY
+    get_portfolio_summary: L0_INVENTORY
+    find_unclassified_repositories: L0_INVENTORY
+
+    # §13.2 Provenance — analysis is read-only; recording a human verdict is not.
+    analyze_repository_origin: L0_INVENTORY
+    compare_repository_lineage: L0_INVENTORY
+    find_candidate_upstreams: L0_INVENTORY
+    estimate_local_contribution: L0_INVENTORY
+    generate_provenance_report: L0_INVENTORY
+    review_provenance_decision: L1_METADATA_WRITE
+
+    # §13.3 Classification — proposals only; applying them is §13.5.
+    classify_repository: L0_INVENTORY
+    classify_portfolio: L0_INVENTORY
+    propose_lifecycle: L0_INVENTORY
+    propose_repository_category: L0_INVENTORY
+    detect_archive_candidates: L0_INVENTORY
+    detect_superseded_projects: L0_INVENTORY
+
+    # §13.4 Governance
+    evaluate_action_policy: L0_INVENTORY
+    create_change_plan: L0_INVENTORY
+    preview_change_plan: L0_INVENTORY
+    approve_change_plan: L4_REPOSITORY_ADMIN
+    execute_approved_plan: L3_CONTROLLED_CODE_WRITE
+    rollback_change_plan: L3_CONTROLLED_CODE_WRITE
+
+    # §13.5 Metadata
+    propose_repository_metadata: L1_METADATA_WRITE
+    apply_repository_taxonomy: L1_METADATA_WRITE
+    standardize_topics: L1_METADATA_WRITE
+    standardize_descriptions: L1_METADATA_WRITE
+    generate_project_catalog: L1_METADATA_WRITE
+
+    # §13.6 Documentation
+    propose_readme_update: L2_CONTENT_PROPOSAL
+    create_documentation_branch: L2_CONTENT_PROPOSAL
+    create_documentation_pr: L2_CONTENT_PROPOSAL
+    add_origin_notice: L2_CONTENT_PROPOSAL
+    add_superseded_notice: L2_CONTENT_PROPOSAL
+
+    # §13.7 Administration — not exposed to general agents.
+    archive_repository: L4_REPOSITORY_ADMIN
+    transfer_repository: L4_REPOSITORY_ADMIN
+    change_visibility: L4_REPOSITORY_ADMIN
+    modify_ruleset: L4_REPOSITORY_ADMIN
+    modify_collaborators: L4_REPOSITORY_ADMIN
+    delete_repository: L5_BREAK_GLASS
+
+  # Tools that would publish a claim of authorship on a public surface (axiom 4).
+  # Denied outright when the origin is unknown or in the fork/mirror family.
+  originality_claim:
+    - generate_project_catalog
+    - standardize_descriptions
+    - propose_repository_metadata
+    - apply_repository_taxonomy
+
+  # Tools whose effect cannot be undone by re-running the opposite tool (§15 risk).
+  irreversible:
+    - archive_repository
+    - transfer_repository
+    - change_visibility
+    - delete_repository
+    - modify_ruleset
+
+  # Tools that add attribution rather than assert ownership — always permitted
+  # where any write is permitted, because §12 *requires* preserve_attribution.
+  attribution_safe:
+    - add_origin_notice
+    - add_superseded_notice
+
+# --------------------------------------------------------------------------
+# §15 risk model. Scores are additive; the thresholds turn a score into a level.
+# --------------------------------------------------------------------------
+risk:
+  weights:
+    level:
+      L0_INVENTORY: 0
+      L1_METADATA_WRITE: 1
+      L2_CONTENT_PROPOSAL: 2
+      L3_CONTROLLED_CODE_WRITE: 4
+      L4_REPOSITORY_ADMIN: 6
+      L5_BREAK_GLASS: 8
+    criticality:
+      LOW: 0
+      MEDIUM: 1
+      HIGH: 3
+      CRITICAL: 5
+    public_repository: 1
+    unknown_origin: 3
+    fork_family_origin: 2
+    no_origin_profile: 2
+    license_review_required: 2
+    irreversible_action: 4
+    unknown_target: 2
+    not_dry_run: 1
+  # Target-count bands: (at least N targets) → added score.
+  target_bands:
+    - {min_targets: 5, score: 1}
+    - {min_targets: 20, score: 2}
+    - {min_targets: 50, score: 3}
+  thresholds:
+    MEDIUM: 3
+    HIGH: 6
+    CRITICAL: 10
+
+# --------------------------------------------------------------------------
+# Axiom 5 — risk up, scope down, lifetime down, approval strength up.
+# --------------------------------------------------------------------------
+token:
+  scope_by_level:
+    L0_INVENTORY: read_metadata
+    L1_METADATA_WRITE: write_metadata
+    L2_CONTENT_PROPOSAL: write_content_pr
+    L3_CONTROLLED_CODE_WRITE: write_content_direct
+    L4_REPOSITORY_ADMIN: admin
+    L5_BREAK_GLASS: admin
+  lifetime_by_risk:
+    LOW: 600
+    MEDIUM: 300
+    HIGH: 120
+    CRITICAL: 60
+  # Ceiling on the scope a given risk level may buy, whatever the tool wants.
+  scope_cap_by_risk:
+    HIGH: write_content_pr
+    CRITICAL: write_metadata
+
+# --------------------------------------------------------------------------
+# §15 constraints handed to the executor.
+# --------------------------------------------------------------------------
+constraints:
+  max_repositories_by_risk:
+    LOW: 50
+    MEDIUM: 20
+    HIGH: 5
+    CRITICAL: 1
+  # Level at and above which a human must approve before anything is applied.
+  approval_required_from_level: L1_METADATA_WRITE
+  break_glass_approvers: 2

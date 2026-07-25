@@ -11,10 +11,13 @@ Two invariants make a re-sync safe to run at any time:
   ``maturity``, ``criticality``, ``agent_access``, ``origin_profile_id`` and
   ``policy_profile`` are seeded when a repository is first discovered and are then
   never touched by inventory again. A nightly sync must not be able to erase a
-  human's classification.
+  human's classification. The single exception is spelled out below.
 * **Only unambiguous GitHub facts become labels.** ``archived == true`` is the one
-  signal GitHub states outright, so it may seed ``Lifecycle.ARCHIVED``. Everything
-  else stays ``UNKNOWN`` and waits for the classifier (axiom 4).
+  signal GitHub states outright, so it may seed ``Lifecycle.ARCHIVED`` — and may
+  also promote a *still-undecided* ``UNKNOWN`` lifecycle later, since a repository
+  archived after its first sync would otherwise stay unlabelled forever. It never
+  overwrites a lifecycle anyone actually decided. Everything else waits for the
+  classifier (axiom 4).
 
 Raw payloads land in ``repository_snapshots`` so Phase 2 can re-analyse without
 re-hitting the API. That table is a *change log*: a payload whose content hash
@@ -544,7 +547,12 @@ class InventorySync:
             row["criticality"] = str(Criticality.LOW)
             row["agent_access"] = str(AgentAccess.READ_ONLY)
             row["policy_profile"] = "default"
-        # else: every overlay column is intentionally absent from `row`, so the
+        elif payload.get("archived") and existing["lifecycle"] == str(Lifecycle.UNKNOWN):
+            # Narrow exception to write-once: a repository archived *after* its first
+            # sync would otherwise stay UNKNOWN forever. Only ever promotes from
+            # UNKNOWN, so a human's or the classifier's verdict is still untouchable.
+            row["lifecycle"] = str(Lifecycle.ARCHIVED)
+        # Otherwise every overlay column is intentionally absent from `row`, so the
         # generated ON CONFLICT DO UPDATE cannot touch a human's classification.
 
         return row

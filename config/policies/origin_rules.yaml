@@ -1,0 +1,304 @@
+# EveAegis origin rules (§7.3).
+#
+# These rules, not Python, decide what a repository's origin is. Editing this file
+# is a governance action: it changes verdicts that appear on public project pages.
+#
+# ---------------------------------------------------------------------------
+# Precedence (§7.2) — declared per rule via `signal_tier`, strongest first:
+#
+#   fork_metadata       official GitHub fork / parent / source / template metadata
+#   commit_ancestry     shared root commits, merge-base, commit-set overlap
+#   blob_history        byte-identical blob overlap
+#   attribution         explicit human statement in README / NOTICE / LICENSE
+#   token_similarity    MinHash / winnowing over normalized tokens
+#   ast_similarity      structural similarity (not implemented in v0.1)
+#   semantic_similarity embedding similarity (out of scope, §25)
+#   structural          repository *shape* heuristics (scaffold, vendor dump, plugin)
+#   fallback            catch-all
+#
+# A rule on a weaker tier can never overturn a rule on a stronger tier. Agreement
+# from a weaker tier adds a small confidence bonus; disagreement is recorded as
+# dissent for the human reviewer and changes nothing.
+#
+# ---------------------------------------------------------------------------
+# Condition language: a flat fact dictionary, one key per line.
+#
+#   key: true | false          boolean equality (also the existence check, because
+#                              `*.exists` facts are always present as booleans)
+#   key: SOME_VALUE            equality
+#   key: [A, B, C]             membership
+#   key: "in: A, B"            membership, explicit form
+#   key: ">=0.30"              numeric comparison; also <=, >, <, ==, !=
+#   key: null                  fact absent or null
+#
+# A missing fact makes its condition FAIL. Absence is never read as false or zero —
+# that is exactly how a system talks itself into a confident verdict it cannot
+# support (§29: "每個判定有證據與信心").
+#
+# ---------------------------------------------------------------------------
+# Available facts are produced by ProvenanceEngine.build_facts(); see
+# src/eveaegis/provenance/engine.py for the authoritative list.
+
+version: 1
+
+rules:
+
+  # -- fork metadata: authoritative, GitHub itself is the witness ------------
+
+  - id: native-github-fork
+    description: >
+      GitHub's own fork network says so. Nothing weaker may override this, and no
+      amount of local rewriting turns it into an original project (axiom 4).
+    signal_tier: fork_metadata
+    when:
+      github.fork: true
+      github.parent.exists: true
+    result:
+      origin_type: GITHUB_FORK
+      confidence: 1.0
+      requires_review: true
+      public_label: Fork of an upstream project
+
+  - id: github-fork-without-parent
+    description: >
+      Flagged as a fork but the parent is gone (deleted or private). The fork fact
+      is still authoritative; the ancestor simply cannot be named.
+    signal_tier: fork_metadata
+    when:
+      github.fork: true
+      github.parent.exists: false
+    result:
+      origin_type: GITHUB_FORK
+      confidence: 0.90
+      requires_review: true
+      public_label: Fork of an upstream project
+
+  - id: template-derived
+    description: >
+      Generated from a GitHub template and then genuinely built on. §7.3 requires
+      real local contribution before this counts as a project rather than scaffolding.
+    signal_tier: fork_metadata
+    when:
+      template_signature.detected: true
+      template_files_removed_or_modified: true
+      local_contribution: ">=0.50"
+    result:
+      origin_type: TEMPLATE_DERIVED
+      confidence: 0.80
+      public_label: Built from a project template
+
+  - id: template-untouched
+    description: Template metadata present with little sign of local work on top.
+    signal_tier: fork_metadata
+    when:
+      template_signature.detected: true
+      template_files_removed_or_modified: false
+    result:
+      origin_type: GENERATED_PROJECT
+      confidence: 0.70
+      requires_review: true
+      public_label: Generated from a project template
+
+  # -- commit ancestry ------------------------------------------------------
+
+  - id: detached-fork-shared-history
+    description: >
+      Not in GitHub's fork network, but the histories share a root commit and a
+      substantial commit set. This is the case §6.1 question 4 exists to catch.
+    signal_tier: commit_ancestry
+    when:
+      github.fork: false
+      similarity.commit: ">=0.30"
+      common_root_commit: true
+    result:
+      origin_type: DETACHED_FORK
+      confidence: 0.95
+      requires_review: true
+      public_label: Modified upstream project
+
+  - id: mirror-detection
+    description: >
+      Tracks an upstream almost exactly, with negligible local commits. A mirror is
+      not authorship, however many commits it contains.
+    signal_tier: commit_ancestry
+    when:
+      sync_pattern.detected: true
+      local_unique_commits: "<=3"
+      upstream_retained: ">=0.95"
+    result:
+      origin_type: MIRROR
+      confidence: 0.90
+      requires_review: true
+      public_label: Mirror of an upstream project
+
+  - id: upstream-import-shared-root
+    description: >
+      History was imported wholesale (shared root commit) but has since diverged far
+      enough that the commit sets barely overlap.
+    signal_tier: commit_ancestry
+    when:
+      github.fork: false
+      common_root_commit: true
+      similarity.commit: "<0.30"
+    result:
+      origin_type: UPSTREAM_IMPORT
+      confidence: 0.75
+      requires_review: true
+      public_label: Imported upstream project
+
+  # -- exact blob history ---------------------------------------------------
+
+  - id: derivative-high-blob-overlap
+    description: >
+      No shared commits, yet most effective files are byte-identical to a candidate
+      upstream — a copy that discarded the history.
+    signal_tier: blob_history
+    when:
+      github.fork: false
+      common_root_commit: false
+      similarity.blob: ">=0.60"
+    result:
+      origin_type: DERIVATIVE_PROJECT
+      confidence: 0.80
+      requires_review: true
+      public_label: Derived from an upstream project
+
+  # -- explicit attribution -------------------------------------------------
+
+  - id: declared-fork-in-documentation
+    description: >
+      The repository's own documentation says it is based on something else. A human
+      statement outranks any fingerprint, but not GitHub's fork metadata.
+    signal_tier: attribution
+    when:
+      attribution.explicit_fork_statement: true
+    result:
+      origin_type: DERIVATIVE_PROJECT
+      confidence: 0.75
+      requires_review: true
+      public_label: Derived from an upstream project
+
+  - id: multi-source-composite
+    description: Documentation credits several distinct upstream projects.
+    signal_tier: attribution
+    when:
+      attribution.detected: true
+      attribution.upstream_count: ">=2"
+    result:
+      origin_type: MULTI_SOURCE_COMPOSITE
+      confidence: 0.65
+      requires_review: true
+      public_label: Composite project with multiple upstreams
+
+  # -- normalized token similarity ------------------------------------------
+
+  - id: derivative-token-similarity
+    description: >
+      Token fingerprints match a candidate upstream closely without any history or
+      blob evidence. Weak on its own; §7.2 keeps it below everything above.
+    signal_tier: token_similarity
+    when:
+      github.fork: false
+      similarity.token: ">=0.70"
+      candidates.count: ">=1"
+    result:
+      origin_type: DERIVATIVE_PROJECT
+      confidence: 0.60
+      requires_review: true
+      public_label: Possibly derived from an upstream project
+
+  # -- repository shape -----------------------------------------------------
+
+  - id: vendor-snapshot
+    description: >
+      The repository is overwhelmingly copied third-party trees with almost no
+      effective content of its own — an archive of someone else's code.
+    signal_tier: structural
+    when:
+      tree.vendored_ratio: ">=0.60"
+      tree.effective_ratio: "<=0.25"
+    result:
+      origin_type: VENDOR_SNAPSHOT
+      confidence: 0.70
+      requires_review: true
+      public_label: Vendored snapshot of third-party code
+
+  - id: generated-scaffold
+    description: >
+      A framework scaffold that was never built on: generator markers present,
+      almost no hand-written content.
+    signal_tier: structural
+    when:
+      generated.scaffold_detected: true
+      tree.effective_files: "<=25"
+    result:
+      origin_type: GENERATED_PROJECT
+      confidence: 0.65
+      requires_review: true
+      public_label: Generated project scaffold
+
+  - id: plugin-or-extension
+    description: >
+      Original code that is nonetheless written against a declared host platform
+      (browser extension, editor plugin, framework plugin). §9.1: depending on a
+      host is not descending from it.
+    signal_tier: structural
+    when:
+      github.fork: false
+      plugin.signature_detected: true
+      candidates.count: 0
+      attribution.explicit_fork_statement: false
+    result:
+      origin_type: PLUGIN_OR_EXTENSION
+      confidence: 0.80
+      public_label: Plugin or extension
+
+  - id: original-with-dependencies
+    description: >
+      No fork metadata, no template, no upstream candidate, no attribution of a base
+      project — but declared dependencies. §9.1: dependencies are not ancestry.
+    signal_tier: structural
+    when:
+      github.fork: false
+      github.template.exists: false
+      candidates.count: 0
+      attribution.explicit_fork_statement: false
+      tree.has_dependency_manifest: true
+      tree.effective_files: ">=3"
+    result:
+      origin_type: ORIGINAL_WITH_DEPENDENCIES
+      confidence: 0.88
+      public_label: Original project
+
+  - id: original
+    description: >
+      No fork metadata, no template, no upstream candidate, no attribution and no
+      dependency manifest. The strongest "original" statement this engine will make
+      from tree-level evidence, and still not a claim of 100% originality (§8.1).
+    signal_tier: structural
+    when:
+      github.fork: false
+      github.template.exists: false
+      candidates.count: 0
+      attribution.explicit_fork_statement: false
+      tree.has_dependency_manifest: false
+      tree.effective_files: ">=3"
+    result:
+      origin_type: ORIGINAL
+      confidence: 0.88
+      public_label: Original project
+
+  # -- catch-all ------------------------------------------------------------
+
+  - id: unknown-origin
+    description: >
+      Nothing above matched, or the repository is too small or too empty to say
+      anything. Axiom 4: this is a first-class answer, not a failure.
+    signal_tier: fallback
+    when:
+      analysis.completed: true
+    result:
+      origin_type: UNKNOWN
+      confidence: 0.0
+      requires_review: true
+      public_label: Origin under review

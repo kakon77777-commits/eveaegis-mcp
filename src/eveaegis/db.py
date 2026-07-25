@@ -363,11 +363,23 @@ def iso(value: datetime | str | None) -> str | None:
     return value
 
 
-def upsert(conn: sqlite3.Connection, table: str, row: dict[str, Any], keys: Iterable[str]) -> None:
-    """INSERT … ON CONFLICT(keys) DO UPDATE for every non-key column."""
+def upsert(
+    conn: sqlite3.Connection,
+    table: str,
+    row: dict[str, Any],
+    keys: Iterable[str],
+    *,
+    skip_update: Iterable[str] = (),
+) -> None:
+    """INSERT … ON CONFLICT(keys) DO UPDATE for every non-key column.
+
+    ``skip_update`` names columns that are written on insert but never on update —
+    the governance overlay uses this so a re-sync cannot erase a classification.
+    """
     cols = list(row)
     key_list = list(keys)
-    updates = [c for c in cols if c not in key_list]
+    protected = set(skip_update)
+    updates = [c for c in cols if c not in key_list and c not in protected]
     placeholders = ", ".join("?" for _ in cols)
     sql = f"INSERT INTO {table} ({', '.join(cols)}) VALUES ({placeholders})"
     if updates:

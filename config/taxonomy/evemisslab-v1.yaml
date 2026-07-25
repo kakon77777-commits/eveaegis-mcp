@@ -1,0 +1,398 @@
+# EveAegis classification profile "evemisslab-v1" (whitepaper §5, §27).
+#
+# The classifier reads *only* this file for its vocabulary. Tuning the portfolio
+# must never require a code edit — that is the whole point of keeping the keyword
+# maps, the topic vocabulary and the criticality hints out here.
+#
+# Scoring model: every source of evidence (topic / file marker / repository name /
+# description / README / language) contributes its family weight to one or more
+# categories. The winner must clear `thresholds.min_category_score` AND beat the
+# runner-up by `thresholds.min_category_margin`, otherwise the verdict is UNKNOWN.
+# Absence of evidence is a first-class answer (axiom 4 in spirit).
+
+schema_version: "0.1"
+profile: evemisslab-v1
+
+# --------------------------------------------------------------------------
+# Evidence family weights. Structural facts outrank prose.
+# --------------------------------------------------------------------------
+weights:
+  topic: 0.50          # a curated GitHub topic is a deliberate human statement
+  file_marker: 0.35    # a file on disk is harder to fake than a description
+  name: 0.30
+  description: 0.25
+  readme: 0.15         # README prose is the weakest signal; it is marketing copy
+  language: 0.15
+  homepage: 0.20
+
+thresholds:
+  min_category_score: 0.30
+  min_category_margin: 0.10
+  # Lifecycle windows, in days since the last push.
+  active_days: 90
+  maintenance_days: 365
+  stale_days: 365
+  archive_candidate_days: 540
+  archive_candidate_max_stars: 3
+  # A repository below this size with no marker files is treated as an idea, not a product.
+  idea_max_size_kb: 40
+  superseded_name_overlap: 0.60
+
+# --------------------------------------------------------------------------
+# §5.1 Topic vocabulary. An exact topic match is the strongest textual signal.
+# --------------------------------------------------------------------------
+topic_category:
+  mcp: SERVICE
+  mcp-server: SERVICE
+  api: SERVICE
+  backend: SERVICE
+  worker: SERVICE
+  cloudflare-workers: SERVICE
+  serverless: SERVICE
+  agent: AGENT
+  ai-agent: AGENT
+  agents: AGENT
+  autonomous-agent: AGENT
+  llm-agent: AGENT
+  website: WEBSITE
+  webpage: WEBSITE
+  landing-page: WEBSITE
+  static-site: WEBSITE
+  github-pages: WEBSITE
+  blog: WEBSITE
+  library: LIBRARY
+  sdk: LIBRARY
+  package: LIBRARY
+  toolkit: LIBRARY
+  framework: LIBRARY
+  compiler: LIBRARY
+  transpiler: LIBRARY
+  parser: LIBRARY
+  research: RESEARCH
+  paper: RESEARCH
+  papers: RESEARCH
+  whitepaper: RESEARCH
+  formal-methods: RESEARCH
+  reproducible-research: RESEARCH
+  theory: RESEARCH
+  mathematics: RESEARCH
+  experiment: RESEARCH
+  dataset: DATASET
+  datasets: DATASET
+  corpus: DATASET
+  data: DATASET
+  benchmark: DATASET
+  documentation: DOCUMENTATION
+  docs: DOCUMENTATION
+  awesome: DOCUMENTATION
+  handbook: DOCUMENTATION
+  specification: DOCUMENTATION
+  game: GAME
+  gamedev: GAME
+  mod: GAME
+  rpg: GAME
+  godot: GAME
+  unity: GAME
+  plugin: PLUGIN
+  extension: PLUGIN
+  chrome-extension: PLUGIN
+  browser-extension: PLUGIN
+  vscode-extension: PLUGIN
+  addon: PLUGIN
+  obsidian-plugin: PLUGIN
+  product: PRODUCT
+  app: PRODUCT
+  application: PRODUCT
+  desktop-app: PRODUCT
+  editor: PRODUCT
+  saas: PRODUCT
+  prototype: PROTOTYPE
+  poc: PROTOTYPE
+  proof-of-concept: PROTOTYPE
+  sandbox: PROTOTYPE
+  playground: PROTOTYPE
+  mirror: MIRROR
+  fork: FORK
+  archive: ARCHIVE
+  archived: ARCHIVE
+  reference: REFERENCE
+  template: REFERENCE
+
+# --------------------------------------------------------------------------
+# §5.1 Free-text keywords, matched against repository name, description and README.
+# Keep these lowercase and reasonably specific — a stray word costs precision.
+# --------------------------------------------------------------------------
+category_keywords:
+  WEBSITE:
+    - website
+    - web site
+    - homepage
+    - landing page
+    - official site
+    - 官網
+    - 網站
+    - static site
+    - portfolio site
+  SERVICE:
+    - mcp server
+    - rest api
+    - http api
+    - microservice
+    - web service
+    - backend service
+    - worker
+    - daemon
+    - gateway
+    - control plane
+  AGENT:
+    - ai agent
+    - autonomous agent
+    - agent runtime
+    - agentic
+    - multi-agent
+    - 代理
+  LIBRARY:
+    - library
+    - sdk
+    - reusable component
+    - npm package
+    - python package
+    - compiler
+    - transpiler
+    - parser
+    - engine for
+  RESEARCH:
+    - research
+    - whitepaper
+    - white paper
+    - technical paper
+    - 論文
+    - 白皮書
+    - theory
+    - formal
+    - experiment log
+    - study
+  DATASET:
+    - dataset
+    - data set
+    - corpus
+    - benchmark suite
+    - collection of data
+    - 資料集
+    - 語料
+  DOCUMENTATION:
+    - documentation
+    - docs site
+    - handbook
+    - specification
+    - spec for
+    - guide
+    - 說明文件
+    - 手冊
+  GAME:
+    - game
+    - gameplay
+    - rpg
+    - mod for
+    - 遊戲
+    - 模組
+  PLUGIN:
+    - plugin
+    - extension for
+    - browser extension
+    - chrome extension
+    - vscode extension
+    - add-on
+    - 外掛
+  PRODUCT:
+    - desktop app
+    - application for
+    - end-user
+    - product
+    - workbench
+    - studio
+    - editor for
+  PROTOTYPE:
+    - prototype
+    - proof of concept
+    - proof-of-concept
+    - scratch
+    - playground
+    - sandbox
+    - toy implementation
+    - 原型
+  MIRROR:
+    - mirror of
+    - read-only mirror
+    - 鏡像
+  REFERENCE:
+    - reference implementation
+    - for reference only
+    - kept for reference
+    - template repository
+    - starter template
+  ARCHIVE:
+    - archived project
+    - no longer maintained
+    - 已封存
+
+# --------------------------------------------------------------------------
+# File markers. Presence of a file is structural evidence, not prose.
+# Keys are matched case-insensitively against repository paths.
+# --------------------------------------------------------------------------
+file_category:
+  package.json: [LIBRARY, SERVICE]
+  pyproject.toml: [LIBRARY]
+  setup.py: [LIBRARY]
+  cargo.toml: [LIBRARY]
+  go.mod: [LIBRARY, SERVICE]
+  dockerfile: [SERVICE]
+  docker-compose.yml: [SERVICE]
+  wrangler.toml: [SERVICE]
+  wrangler.jsonc: [SERVICE]
+  procfile: [SERVICE]
+  index.html: [WEBSITE]
+  _config.yml: [WEBSITE]
+  astro.config.mjs: [WEBSITE]
+  next.config.js: [WEBSITE]
+  manifest.json: [PLUGIN]
+  mkdocs.yml: [DOCUMENTATION]
+  docusaurus.config.js: [DOCUMENTATION]
+  book.toml: [DOCUMENTATION]
+  project.godot: [GAME]
+  data/: [DATASET]
+  datasets/: [DATASET]
+  papers/: [RESEARCH]
+  notebooks/: [RESEARCH]
+
+# Files that are evidence of engineering maturity rather than of category.
+maturity_markers:
+  tests: [tests/, test/, spec/, __tests__/]
+  ci: [.github/workflows/, .gitlab-ci.yml, azure-pipelines.yml]
+  release: [changelog.md, changelog, release-notes.md]
+  packaging: [pyproject.toml, package.json, cargo.toml, setup.py]
+
+# --------------------------------------------------------------------------
+# Primary-language hints. Weakest structural signal; never decisive alone.
+# --------------------------------------------------------------------------
+language_category:
+  HTML: [WEBSITE]
+  CSS: [WEBSITE]
+  Jupyter Notebook: [RESEARCH]
+  TeX: [RESEARCH]
+  GDScript: [GAME]
+  Dockerfile: [SERVICE]
+
+# --------------------------------------------------------------------------
+# §5.2 Lifecycle markers read out of README prose. English + zh-Hant, because the
+# portfolio is bilingual and a zh-only notice must not be invisible to governance.
+# --------------------------------------------------------------------------
+superseded_markers:
+  - superseded by
+  - superseded-by
+  - replaced by
+  - moved to
+  - has moved to
+  - now lives at
+  - now maintained at
+  - development continues at
+  - deprecated in favor of
+  - deprecated in favour of
+  - use instead
+  - 已被取代
+  - 已遷移
+  - 已搬遷
+  - 請改用
+  - 繼任專案
+
+deprecated_markers:
+  - deprecated
+  - no longer maintained
+  - unmaintained
+  - abandoned
+  - discontinued
+  - 停止維護
+  - 已淘汰
+
+# §5.3 Maturity prose markers.
+maturity_keywords:
+  CONCEPT: [idea, concept, draft, sketch, brainstorm, 構想, 草稿]
+  MVP: [mvp, minimum viable, first cut, 最小可行]
+  ALPHA: [alpha, early stage, unstable, wip, work in progress]
+  BETA: [beta, release candidate, preview release, 公測]
+  STABLE: [stable, production ready, ga release, 穩定版]
+  PRODUCTION: [in production, live at, deployed at, 正式上線, 已上線]
+  LEGACY: [legacy, end of life, eol, 已停止開發]
+
+# --------------------------------------------------------------------------
+# §5.4 Criticality hints. Criticality has no UNKNOWN member, so LOW is the
+# least-privilege default and every escalation above it must be justified here.
+# --------------------------------------------------------------------------
+criticality_hints:
+  # Repositories named here are the portfolio's load-bearing assets.
+  critical_repositories: []
+  high_repositories: []
+  # Substrings in the repository name that imply the asset is load-bearing.
+  high_name_keywords:
+    - eveglyph
+    - eml
+    - agiright
+    - logic-matrix
+    - ctcl
+    - aiboard
+    - ai-board
+    - evemiss
+  critical_topics:
+    - production
+    - flagship
+    - security
+  high_topics:
+    - public-site
+    - live
+    - platform
+  # A public repository that is actively pushed and advertises a homepage is at
+  # least MEDIUM: breaking it is publicly visible.
+  medium_when_public_and_active: true
+  # Popularity thresholds (stars) that raise criticality on their own.
+  high_min_stars: 25
+  critical_min_stars: 200
+
+# --------------------------------------------------------------------------
+# §5.5 Agent access. The classifier proposes a *ceiling*, never a grant.
+# The effective ceiling is min(classification proposal, origin-type cap).
+# --------------------------------------------------------------------------
+agent_access:
+  # Highest mode the classifier will ever propose on its own. Anything above this
+  # requires a human decision, so an autonomous mis-classification cannot buy
+  # itself write access.
+  max_proposed: PR_ONLY
+  # Origin-type caps (§12). Missing origin profile means "not analysed yet".
+  origin_caps:
+    ORIGINAL: CONTROLLED_WRITE
+    ORIGINAL_WITH_DEPENDENCIES: CONTROLLED_WRITE
+    TEMPLATE_DERIVED: PR_ONLY
+    PLUGIN_OR_EXTENSION: PR_ONLY
+    GENERATED_PROJECT: PR_ONLY
+    GITHUB_FORK: PR_ONLY
+    DETACHED_FORK: PR_ONLY
+    DERIVATIVE_PROJECT: PR_ONLY
+    UPSTREAM_IMPORT: READ_ONLY
+    MULTI_SOURCE_COMPOSITE: READ_ONLY
+    MIRROR: READ_ONLY
+    VENDOR_SNAPSHOT: READ_ONLY
+    UNKNOWN: READ_ONLY
+  # No origin profile row at all — Phase 2 has not run for this repository.
+  no_origin_profile_cap: READ_ONLY
+  # An origin verdict this uncertain is not a basis for granting anything.
+  low_confidence_threshold: 0.50
+  low_confidence_cap: READ_ONLY
+  # Lifecycles that freeze a repository regardless of everything else.
+  frozen_lifecycles: [ARCHIVED, SUPERSEDED]
+  frozen_cap: READ_ONLY
+  # Categories that are, by definition, somebody else's code.
+  foreign_categories: [FORK, MIRROR, REFERENCE, ARCHIVE]
+  foreign_cap: READ_ONLY
+  # Breaking a CRITICAL repository is never worth an autonomous direct write.
+  critical_cap: PR_ONLY
+  # Nothing is understood about this repository yet.
+  unknown_lifecycle_cap: READ_ONLY

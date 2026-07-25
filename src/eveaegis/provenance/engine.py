@@ -1,0 +1,1607 @@
+"""Origin & Provenance Engine (§6, §7, §22 判定流程, §23 public/internal split).
+
+This is the module that answers §6.1's seven questions, and the one whose mistakes
+are most expensive: an origin verdict ends up on a public project page. Three
+properties are therefore enforced structurally rather than by convention.
+
+**Axiom 4 — never auto-claim originality.** The public label is derived, not copied,
+from the internal verdict. Any origin type in
+:data:`~eveaegis.taxonomy.NO_AUTOMATIC_ORIGINALITY_CLAIM`, any confidence below
+:data:`ORIGINALITY_CLAIM_THRESHOLD`, and any verdict without evidence produces
+``originality_claim = "none"`` plus ``NEEDS_REVIEW``. There is exactly one function
+that can emit a non-``none`` claim (:func:`_public_label`) and it applies all three
+tests before doing so.
+
+**§9.1 — dependency ≠ upstream ≠ vendored.** :func:`~.components.classify_paths`
+runs before any similarity computation, and every ratio in this module divides by
+*effective* content only. A repository full of ``node_modules`` cannot read as
+"mostly upstream" because those paths never enter a denominator.
+
+**§21 — never execute repository code.** Deep mode goes through
+:mod:`.gitlocal`, which gates on ``allow_repository_code_execution`` and clones
+bare-mirrored with hooks and alternate transports disabled. No build tool is ever
+invoked, in any mode.
+
+Two depths (§24 Phase 2):
+
+shallow (default)
+    GitHub metadata, tree, README/LICENSE/NOTICE text, dependency manifests. No
+    clone. Fast enough to sweep a whole portfolio.
+deep
+    Additionally mirrors the repository (and, when one is worth testing, its best
+    upstream candidate) to compute S_commit and S_blob from real objects.
+"""
+
+from __future__ import annotations
+
+import json
+import re
+import sqlite3
+import uuid
+from datetime import datetime, timezone
+from typing import Any, Mapping, Sequence
+
+from ..config import AnalysisConfig
+from ..core import GovernanceCore
+from ..credentials import TokenScope
+from ..db import dumps, loads, upsert
+from ..githubapi import GitHubClient
+from ..githubapi.client import GitHubError, NotFound
+from ..models import (
+    ComponentProfile,
+    ContributionEstimate,
+    Evidence,
+    OriginProfile,
+    PublicLabel,
+    SimilarityVector,
+    UpstreamCandidate,
+)
+from ..taxonomy import (
+    NO_AUTOMATIC_ORIGINALITY_CLAIM,
+    ComponentClass,
+    Confidence,
+    ContributionBand,
+    EvidenceKind,
+    LicenseStatus,
+    OriginType,
+    ReviewStatus,
+)
+from . import gitlocal
+from .components import ComponentSummary, classify_paths
+from .contribution import describe as describe_contribution
+from .contribution import estimate_contribution
+from .fingerprint import (
+    blob_similarity,
+    commit_similarity,
+    normalized_text_hash,
+    overlap_coefficient,
+)
+from .rules import OriginRule, RuleEvaluation, evaluate_rules, load_rules
+
+#: A public originality claim needs at least this much confidence (axiom 4).
+ORIGINALITY_CLAIM_THRESHOLD = 0.85
+
+#: Candidate discovery channels that actually assert ancestry. A bare README link
+#: to another repository does *not* qualify — otherwise every project that cites a
+#: dependency would look derived, which is precisely the §9.1 error.
+UPSTREAM_DISCOVERY_CHANNELS: frozenset[str] = frozenset(
+    {
+        "github_fork_parent",
+        "github_fork_source",
+        "github_template",
+        "attribution_statement",
+        "notice_attribution",
+        "manifest_repository_mismatch",
+        "submodule_url",
+        "github_search",
+    }
+)
+
+#: Paths so common they carry no signal; excluded from path-overlap comparison.
+_UNIVERSAL_PATHS: frozenset[str] = frozenset(
+    {
+        "readme.md", "readme.rst", "readme.txt", "license", "license.md", "license.txt",
+        ".gitignore", ".gitattributes", ".editorconfig", "package.json", "pyproject.toml",
+        "setup.py", "requirements.txt", "makefile", "dockerfile", "index.html", "main.py",
+        "index.js", "src/index.js", "src/main.py", "contributing.md", "changelog.md",
+    }
+)
+
+#: Minimum effective paths on both sides before path overlap means anything.
+_MIN_PATHS_FOR_OVERLAP = 10
+
+_GITHUB_REPO_RE = re.compile(
+    r"github\.com[/:]([A-Za-z0-9][\w.-]*)/([A-Za-z0-9][\w.-]*?)(?:\.git)?(?=[/\s)\]\"'>,;]|$)",
+    re.IGNORECASE,
+)
+
+#: Attribution phrasing, English and zh-Hant — Neo.K's portfolio is bilingual and a
+#: fork declared only in Chinese must not read as an undeclared derivation.
+_FORK_STATEMENT_RE = re.compile(
+    r"(forked\s+from|fork\s+of|a\s+fork\s+of|based\s+(?:up)?on|derived\s+from|"
+    r"originally\s+(?:by|from|written\s+by)|adapted\s+from|ported\s+from|"
+    r"改編自|改自|衍生自|基於|基于|分支自|源自|移植自|フォーク)",
+    re.IGNORECASE,
+)
+
+_SCAFFOLD_MARKERS: tuple[str, ...] = (
+    "bootstrapped with create react app",
+    "this project was bootstrapped",
+    "npm create vite",
+    "created with vite",
+    "generated by angular cli",
+    "this is a next.js project bootstrapped",
+    "django-admin startproject",
+    "rails new",
+    "yeoman generator",
+    "cookiecutter",
+    "generated by cargo",
+    "scaffolded with",
+)
+
+_PLUGIN_HINTS: tuple[str, ...] = (
+    "eslint-plugin", "babel-plugin", "vite-plugin", "rollup-plugin", "webpack-plugin",
+    "gatsby-plugin", "fastify-plugin", "pytest11", "obsidian", "vscode", "jupyterlab",
+)
+
+_COPYLEFT_TOKENS: tuple[str, ...] = (
+    "gnu general public license", "gnu affero", "gnu lesser general public",
+    "mozilla public license", "eclipse public license", "common development and distribution",
+    "server side public license", "gpl-3", "gpl-2", "agpl", "lgpl", "mpl-2", "epl-2",
+)
+
+_PERMISSIVE_SPDX: frozenset[str] = frozenset(
+    {"MIT", "APACHE-2.0", "BSD-2-CLAUSE", "BSD-3-CLAUSE", "ISC", "0BSD", "UNLICENSE", "MIT-0", "ZLIB"}
+)
+
+_COPYLEFT_SPDX_PREFIXES: tuple[str, ...] = ("GPL", "AGPL", "LGPL", "MPL", "EPL", "CDDL", "SSPL", "OSL", "CC-BY-SA")
+
+#: Documentary files worth fetching in shallow mode, in priority order.
+_DOCUMENT_FILES: tuple[str, ...] = (
+    "NOTICE", "NOTICE.md", "NOTICE.txt",
+    "AUTHORS", "AUTHORS.md", "CONTRIBUTORS", "CONTRIBUTORS.md",
+    "CREDITS", "CREDITS.md", "ACKNOWLEDGEMENTS.md", "ACKNOWLEDGMENTS.md",
+    "LICENSE", "LICENSE.md", "LICENSE.txt", "COPYING",
+)
+
+_MANIFEST_FILES: tuple[str, ...] = (
+    "package.json", "pyproject.toml", "Cargo.toml", "go.mod", "composer.json",
+    "manifest.json", "deno.json", "pubspec.yaml",
+)
+
+#: GitHub's tree endpoint caps out here; beyond it the tree is silently partial.
+_TREE_ENTRY_LIMIT = 100_000
+
+#: Public labels by origin type (§23.2). Conservative wording throughout.
+_PUBLIC_LABELS: dict[OriginType, str] = {
+    OriginType.ORIGINAL: "Original project",
+    OriginType.ORIGINAL_WITH_DEPENDENCIES: "Original project",
+    OriginType.GITHUB_FORK: "Fork of an upstream project",
+    OriginType.DETACHED_FORK: "Modified upstream project",
+    OriginType.MIRROR: "Mirror of an upstream project",
+    OriginType.TEMPLATE_DERIVED: "Built from a project template",
+    OriginType.UPSTREAM_IMPORT: "Imported upstream project",
+    OriginType.DERIVATIVE_PROJECT: "Derived from an upstream project",
+    OriginType.PLUGIN_OR_EXTENSION: "Plugin or extension",
+    OriginType.MULTI_SOURCE_COMPOSITE: "Composite project with multiple upstreams",
+    OriginType.VENDOR_SNAPSHOT: "Vendored snapshot of third-party code",
+    OriginType.GENERATED_PROJECT: "Generated project scaffold",
+    OriginType.UNKNOWN: "Origin under review",
+}
+
+#: The only origin types allowed to carry a non-"none" claim, and what they claim.
+_CLAIMABLE: dict[OriginType, str] = {
+    OriginType.ORIGINAL: "original",
+    OriginType.ORIGINAL_WITH_DEPENDENCIES: "original",
+    OriginType.PLUGIN_OR_EXTENSION: "original",
+    OriginType.TEMPLATE_DERIVED: "partial",
+    OriginType.GENERATED_PROJECT: "partial",
+}
+
+#: Review states that still want a human (§19.3).
+REVIEW_PENDING: frozenset[ReviewStatus] = frozenset(
+    {ReviewStatus.NEEDS_REVIEW, ReviewStatus.LEGAL_REVIEW_REQUESTED, ReviewStatus.UNREVIEWED}
+)
+
+
+class ProvenanceError(RuntimeError):
+    pass
+
+
+def _now() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+# --------------------------------------------------------------------------
+# gathered inputs
+# --------------------------------------------------------------------------
+
+class RepositoryEvidenceBundle:
+    """Everything read about one repository before any judgement is formed.
+
+    Kept as an explicit object so :meth:`ProvenanceEngine.build_facts` is a pure
+    function of observations — which makes the verdict reproducible from a stored
+    bundle without touching the network again (§21 "clone → static inspect → …").
+    """
+
+    def __init__(self, full_name: str, repository_id: str, metadata: Mapping[str, Any]) -> None:
+        self.full_name = full_name
+        self.repository_id = repository_id
+        self.metadata: dict[str, Any] = dict(metadata)
+        self.tree: list[dict[str, Any]] = []
+        self.tree_truncated = False
+        self.summary: ComponentSummary = ComponentSummary()
+        self.readme: str | None = None
+        self.documents: dict[str, str] = {}
+        self.manifests: dict[str, str] = {}
+        self.evidence: list[Evidence] = []
+        self.candidates: list[UpstreamCandidate] = []
+        self.deep: bool = False
+        self.deep_notes: list[str] = []
+        #: Facts only a real clone can establish (§6.3 Git Metadata).
+        self.git_facts: dict[str, Any] = {}
+        self.measurement: str = "shallow"
+        self.upstream_retained_files: float | None = None
+        self.upstream_retained_bytes: float | None = None
+        self.upstream_modified_ratio: float | None = None
+        self.license_status: LicenseStatus = LicenseStatus.UNKNOWN
+        self.license_detail: dict[str, Any] = {}
+
+    def add(
+        self,
+        kind: EvidenceKind,
+        key: str,
+        value: Any,
+        *,
+        weight: float = 0.0,
+        supports: Sequence[OriginType] = (),
+        **detail: Any,
+    ) -> Evidence:
+        item = Evidence(
+            kind=kind,
+            key=key,
+            value=str(value),
+            weight=weight,
+            supports=list(supports),
+            detail=detail,
+        )
+        self.evidence.append(item)
+        return item
+
+    @property
+    def upstream_candidates(self) -> list[UpstreamCandidate]:
+        """Candidates from channels that actually assert ancestry (§9.1)."""
+        return [c for c in self.candidates if c.discovered_via in UPSTREAM_DISCOVERY_CHANNELS]
+
+
+# --------------------------------------------------------------------------
+# engine
+# --------------------------------------------------------------------------
+
+class ProvenanceEngine:
+    def __init__(self, core: GovernanceCore) -> None:
+        self.core = core
+        self.cfg: AnalysisConfig = core.cfg.analysis
+        self.rules: list[OriginRule] = load_rules(core.cfg.policy_path)
+
+    # -- public API -------------------------------------------------------
+
+    def analyze(self, full_name: str, *, deep: bool = False) -> OriginProfile:
+        """Run §22's fourteen-step determination flow for one repository."""
+        with self.core.client(TokenScope.READ_CONTENT, reason=f"provenance analysis of {full_name}") as client:
+            bundle = self._gather(client, full_name, deep=deep)
+        facts = self.build_facts(bundle)
+        evaluation = evaluate_rules(self.rules, facts)
+        profile = self._build_profile(bundle, facts, evaluation)
+        self.core.ledger.record(
+            "provenance.analyze",
+            actor="agent:local",
+            tenant=self.core.tenant_id,
+            targets=[full_name],
+            credential_type="github",
+            credential_scope=str(TokenScope.READ_CONTENT),
+            detail={
+                "origin_type": str(profile.origin_type),
+                "confidence": profile.origin_confidence,
+                "matched_rule": profile.matched_rule,
+                "review_status": str(profile.review_status),
+                "depth": "deep" if deep else "shallow",
+                "evidence_count": len(profile.evidence),
+            },
+        )
+        return profile
+
+    def analyze_all(self, *, deep: bool = False, limit: int | None = None) -> list[OriginProfile]:
+        """Analyze the whole inventory, or the live account when it is not synced yet."""
+        profiles: list[OriginProfile] = []
+        for full_name in self._inventory(limit=limit):
+            try:
+                profile = self.analyze(full_name, deep=deep)
+            except (GitHubError, gitlocal.GitError) as exc:
+                # One unreachable repository must not abort a portfolio sweep.
+                self.core.ledger.record(
+                    "provenance.analyze",
+                    actor="agent:local",
+                    tenant=self.core.tenant_id,
+                    targets=[full_name],
+                    result="FAILED",
+                    detail={"error": str(exc)[:500]},
+                )
+                continue
+            profiles.append(profile)
+            if self._repository_row(full_name) is not None:
+                self.save(profile)
+        return profiles
+
+    def save(self, profile: OriginProfile) -> None:
+        """Persist the profile and its child rows (§20.1)."""
+        conn = self.core.conn
+        exists = conn.execute(
+            "SELECT 1 FROM repositories WHERE id = ?", (profile.repository_id,)
+        ).fetchone()
+        if exists is None:
+            raise ProvenanceError(
+                f"repository '{profile.repository_id}' is not in the inventory; "
+                f"run the Phase 1 inventory sync before persisting origin profiles"
+            )
+
+        profile.updated_at = _now()
+        upsert(
+            conn,
+            "origin_profiles",
+            {
+                "id": profile.id,
+                "repository_id": profile.repository_id,
+                "origin_type": str(profile.origin_type),
+                "origin_confidence": profile.origin_confidence,
+                "matched_rule": profile.matched_rule,
+                "upstream_retained_min": profile.contribution.upstream_retained_min,
+                "upstream_retained_max": profile.contribution.upstream_retained_max,
+                "local_contribution_min": profile.contribution.local_contribution_min,
+                "local_contribution_max": profile.contribution.local_contribution_max,
+                "transformation_score": profile.contribution.transformation_score,
+                "contribution_band": str(profile.contribution.band),
+                "contribution_confidence": str(profile.contribution.confidence),
+                "license_status": str(profile.license_status),
+                "public_label": profile.public.label if profile.public else None,
+                "public_attribution": profile.public.attribution if profile.public else None,
+                "public_originality_claim": profile.public.originality_claim if profile.public else "none",
+                "review_status": str(profile.review_status),
+                "reviewed_by": profile.reviewed_by,
+                "evidence": dumps([e.model_dump(mode="json") for e in profile.evidence]),
+                "per_dimension": dumps(profile.contribution.per_dimension),
+                "created_at": profile.created_at.isoformat(),
+                "updated_at": profile.updated_at.isoformat(),
+            },
+            ["id"],
+        )
+        conn.execute("DELETE FROM upstream_candidates WHERE origin_profile_id = ?", (profile.id,))
+        for candidate in profile.upstream_candidates:
+            conn.execute(
+                """
+                INSERT INTO upstream_candidates
+                    (id, origin_profile_id, full_name, discovered_via, similarity,
+                     shared_root_commit, merge_base, confidence, notes)
+                VALUES (?,?,?,?,?,?,?,?,?)
+                """,
+                (
+                    f"upc_{uuid.uuid4().hex[:12]}",
+                    profile.id,
+                    candidate.full_name,
+                    candidate.discovered_via,
+                    dumps(candidate.similarity.model_dump(mode="json")),
+                    int(candidate.shared_root_commit),
+                    candidate.merge_base,
+                    candidate.confidence,
+                    candidate.notes,
+                ),
+            )
+        conn.execute("DELETE FROM component_profiles WHERE origin_profile_id = ?", (profile.id,))
+        for component in profile.components:
+            conn.execute(
+                """
+                INSERT INTO component_profiles
+                    (id, origin_profile_id, path, component_class, bytes, files, reason)
+                VALUES (?,?,?,?,?,?,?)
+                """,
+                (
+                    f"cmp_{uuid.uuid4().hex[:12]}",
+                    profile.id,
+                    component.path,
+                    str(component.component_class),
+                    component.bytes,
+                    component.files,
+                    component.reason,
+                ),
+            )
+        conn.execute(
+            "UPDATE repositories SET origin_profile_id = ? WHERE id = ?",
+            (profile.id, profile.repository_id),
+        )
+        conn.commit()
+
+    def load(self, repository_id: str) -> OriginProfile | None:
+        conn = self.core.conn
+        row = conn.execute(
+            "SELECT * FROM origin_profiles WHERE repository_id = ? ORDER BY updated_at DESC LIMIT 1",
+            (repository_id,),
+        ).fetchone()
+        if row is None:
+            return None
+        return self._row_to_profile(conn, row)
+
+    def review_queue(self) -> list[dict[str, Any]]:
+        """§19.3 — everything a human still has to look at, worst first."""
+        rows = self.core.conn.execute(
+            """
+            SELECT o.*, r.full_name
+            FROM origin_profiles o
+            LEFT JOIN repositories r ON r.id = o.repository_id
+            WHERE o.review_status IN ('UNREVIEWED', 'NEEDS_REVIEW', 'LEGAL_REVIEW_REQUESTED')
+            ORDER BY o.origin_confidence ASC, o.updated_at DESC
+            """
+        ).fetchall()
+        queue: list[dict[str, Any]] = []
+        for row in rows:
+            reasons: list[str] = []
+            if row["origin_type"] == str(OriginType.UNKNOWN):
+                reasons.append("origin could not be determined")
+            if row["origin_confidence"] < ORIGINALITY_CLAIM_THRESHOLD:
+                reasons.append(f"confidence {row['origin_confidence']:.2f} below claim threshold")
+            if row["origin_type"] in {str(t) for t in NO_AUTOMATIC_ORIGINALITY_CLAIM}:
+                reasons.append("origin type may never carry an automatic originality claim (axiom 4)")
+            if row["license_status"] in {
+                str(LicenseStatus.COPYLEFT_TRIGGERED),
+                str(LicenseStatus.REVIEW_REQUIRED),
+                str(LicenseStatus.INCOMPATIBLE),
+            }:
+                reasons.append(f"license status {row['license_status']} needs a human")
+            queue.append(
+                {
+                    "origin_profile_id": row["id"],
+                    "repository_id": row["repository_id"],
+                    "full_name": row["full_name"],
+                    "origin_type": row["origin_type"],
+                    "confidence": row["origin_confidence"],
+                    "matched_rule": row["matched_rule"],
+                    "review_status": row["review_status"],
+                    "license_status": row["license_status"],
+                    "public_originality_claim": row["public_originality_claim"],
+                    "reasons": reasons,
+                }
+            )
+        return queue
+
+    def evidence_report(self, full_name: str) -> str:
+        """§22 step 12 — the markdown a reviewer reads before accepting a verdict."""
+        row = self._repository_row(full_name)
+        profile = self.load(row["id"]) if row is not None else None
+        if profile is None:
+            profile = self.analyze(full_name)
+        return render_report(full_name, profile)
+
+    # -- inventory --------------------------------------------------------
+
+    def _repository_row(self, full_name: str) -> sqlite3.Row | None:
+        return self.core.conn.execute(
+            "SELECT * FROM repositories WHERE tenant_id = ? AND full_name = ?",
+            (self.core.tenant_id, full_name),
+        ).fetchone()
+
+    def _inventory(self, *, limit: int | None = None) -> list[str]:
+        rows = self.core.conn.execute(
+            "SELECT full_name FROM repositories WHERE tenant_id = ? ORDER BY full_name",
+            (self.core.tenant_id,),
+        ).fetchall()
+        if rows:
+            names = [r["full_name"] for r in rows]
+            return names[:limit] if limit else names
+        # Phase 1 has not run yet: read the live account instead of doing nothing.
+        with self.core.client(reason="provenance inventory fallback") as client:
+            names = [repo["full_name"] for repo in client.user_repos()]
+        return names[:limit] if limit else names
+
+    # -- §22 steps 1-10: gathering ----------------------------------------
+
+    def _gather(self, client: GitHubClient, full_name: str, *, deep: bool) -> RepositoryEvidenceBundle:
+        metadata = client.repo(full_name)
+        row = self._repository_row(full_name)
+        repository_id = row["id"] if row is not None else f"repo_{metadata.get('id')}"
+        bundle = RepositoryEvidenceBundle(full_name, repository_id, metadata)
+        bundle.deep = deep
+
+        self._collect_github_metadata(bundle)
+        self._collect_tree(client, bundle)
+        self._collect_documents(client, bundle)
+        self._collect_manifests(client, bundle)
+        self._discover_candidates(bundle)
+        self._compare_with_candidate(client, bundle)
+        if deep:
+            self._deep_compare(bundle)
+        self._analyze_license(bundle)
+        return bundle
+
+    def _collect_github_metadata(self, bundle: RepositoryEvidenceBundle) -> None:
+        """§22 step 1 / §6.3 GitHub Metadata — the strongest tier of evidence (§7.2)."""
+        meta = bundle.metadata
+        parent = (meta.get("parent") or {}).get("full_name")
+        source = (meta.get("source") or {}).get("full_name")
+        template = (meta.get("template_repository") or {}).get("full_name")
+
+        bundle.add(
+            EvidenceKind.GITHUB_METADATA,
+            "github.fork",
+            bool(meta.get("fork")),
+            weight=1.0 if meta.get("fork") else 0.2,
+            supports=[OriginType.GITHUB_FORK] if meta.get("fork") else [],
+        )
+        if parent:
+            bundle.add(
+                EvidenceKind.GITHUB_METADATA,
+                "github.parent",
+                parent,
+                weight=1.0,
+                supports=[OriginType.GITHUB_FORK],
+            )
+            bundle.candidates.append(
+                UpstreamCandidate(
+                    full_name=parent,
+                    discovered_via="github_fork_parent",
+                    confidence=1.0,
+                    notes="GitHub fork network parent",
+                )
+            )
+        if source and source != parent:
+            bundle.add(
+                EvidenceKind.GITHUB_METADATA,
+                "github.source",
+                source,
+                weight=1.0,
+                supports=[OriginType.GITHUB_FORK],
+            )
+            bundle.candidates.append(
+                UpstreamCandidate(
+                    full_name=source,
+                    discovered_via="github_fork_source",
+                    confidence=1.0,
+                    notes="root of the GitHub fork network",
+                )
+            )
+        if template:
+            bundle.add(
+                EvidenceKind.GITHUB_METADATA,
+                "github.template_repository",
+                template,
+                weight=0.9,
+                supports=[OriginType.TEMPLATE_DERIVED, OriginType.GENERATED_PROJECT],
+            )
+            bundle.candidates.append(
+                UpstreamCandidate(
+                    full_name=template,
+                    discovered_via="github_template",
+                    confidence=0.9,
+                    notes="GitHub template repository",
+                )
+            )
+        if meta.get("archived"):
+            bundle.add(EvidenceKind.GITHUB_METADATA, "github.archived", True, weight=0.1)
+        if meta.get("license"):
+            bundle.add(
+                EvidenceKind.GITHUB_METADATA,
+                "github.license",
+                (meta.get("license") or {}).get("spdx_id", "NOASSERTION"),
+                weight=0.2,
+            )
+
+    def _collect_tree(self, client: GitHubClient, bundle: RepositoryEvidenceBundle) -> None:
+        """§22 steps 2 and 8 — read the tree, then separate §9 components at once."""
+        ref = bundle.metadata.get("default_branch") or "HEAD"
+        try:
+            entries = client.tree(bundle.full_name, ref, recursive=True)
+        except (NotFound, GitHubError) as exc:
+            bundle.tree = []
+            bundle.add(EvidenceKind.FILE_EVIDENCE, "tree.unavailable", str(exc)[:200], weight=0.0)
+            return
+        bundle.tree = entries
+        bundle.tree_truncated = len(entries) >= _TREE_ENTRY_LIMIT
+        bundle.summary = classify_paths(entries, config=self.cfg)
+
+        summary = bundle.summary
+        bundle.add(
+            EvidenceKind.FILE_EVIDENCE,
+            "tree.components",
+            f"{summary.effective_files} effective of {summary.total_files} files",
+            weight=0.3,
+            effective_files=summary.effective_files,
+            effective_bytes=summary.effective_bytes,
+            total_files=summary.total_files,
+            total_bytes=summary.total_bytes,
+            dependency_files=summary.dependency_files,
+            vendored_files=summary.vendored_files,
+            generated_files=summary.generated_files,
+            excluded_roots=summary.excluded_roots[:20],
+            truncated=bundle.tree_truncated,
+        )
+        if summary.dependency_files or summary.vendored_files or summary.generated_files:
+            bundle.add(
+                EvidenceKind.DEPENDENCY_EVIDENCE,
+                "components.excluded",
+                f"{summary.dependency_files} dependency / {summary.vendored_files} vendored / "
+                f"{summary.generated_files} generated files excluded from all denominators (§9.1)",
+                weight=0.4,
+                roots=summary.excluded_roots[:20],
+            )
+        if summary.submodule_declared:
+            bundle.add(
+                EvidenceKind.DEPENDENCY_EVIDENCE,
+                "tree.gitmodules",
+                ".gitmodules present",
+                weight=0.3,
+                supports=[OriginType.MULTI_SOURCE_COMPOSITE],
+            )
+
+    def _collect_documents(self, client: GitHubClient, bundle: RepositoryEvidenceBundle) -> None:
+        """§22 step 3 / §6.3 Documentary Evidence. Only files the tree proves exist."""
+        present = {item["path"] for item in bundle.tree if item.get("type") == "blob"}
+        bundle.readme = client.readme(bundle.full_name)
+        if bundle.readme:
+            bundle.add(
+                EvidenceKind.DOCUMENTARY_EVIDENCE,
+                "readme.hash",
+                normalized_text_hash(bundle.readme),
+                weight=0.1,
+                length=len(bundle.readme),
+            )
+        for name in _DOCUMENT_FILES:
+            if name not in present:
+                continue
+            text = client.file_text(bundle.full_name, name)
+            if text:
+                bundle.documents[name] = text
+
+        attribution_hits = self._attribution_hits(bundle)
+        for owner_repo, context, source in attribution_hits:
+            if owner_repo.lower() == bundle.full_name.lower():
+                continue
+            channel = "notice_attribution" if source != "README" else "attribution_statement"
+            bundle.add(
+                EvidenceKind.DOCUMENTARY_EVIDENCE,
+                f"attribution.{source.lower()}",
+                f"{owner_repo} — \"{context[:160]}\"",
+                weight=0.6,
+                supports=[OriginType.DERIVATIVE_PROJECT, OriginType.MULTI_SOURCE_COMPOSITE],
+                source_file=source,
+            )
+            bundle.candidates.append(
+                UpstreamCandidate(
+                    full_name=owner_repo,
+                    discovered_via=channel,
+                    confidence=0.6,
+                    notes=f"credited in {source}: {context[:120]}",
+                )
+            )
+
+        # Plain links are recorded but never counted as ancestry (§9.1).
+        for owner_repo in self._plain_repo_links(bundle):
+            bundle.add(
+                EvidenceKind.DOCUMENTARY_EVIDENCE,
+                "readme.link",
+                owner_repo,
+                weight=0.05,
+                note="link only; not treated as an upstream claim",
+            )
+
+    def _attribution_hits(self, bundle: RepositoryEvidenceBundle) -> list[tuple[str, str, str]]:
+        """Repository references that sit on a line making an ancestry statement."""
+        hits: list[tuple[str, str, str]] = []
+        sources: list[tuple[str, str]] = []
+        if bundle.readme:
+            sources.append(("README", bundle.readme))
+        sources.extend((name, text) for name, text in bundle.documents.items())
+
+        for source, text in sources:
+            for line in text.splitlines():
+                if not _FORK_STATEMENT_RE.search(line):
+                    continue
+                for owner, repo in _GITHUB_REPO_RE.findall(line):
+                    if owner.lower() in {"sponsors", "features", "topics", "orgs", "apps", "marketplace"}:
+                        continue
+                    hits.append((f"{owner}/{repo}", line.strip(), source))
+            # A NOTICE file is an attribution document by definition: every repository
+            # it names is a credited source even without a trigger phrase (§6.3).
+            if source.upper().startswith(("NOTICE", "AUTHORS", "CREDITS", "ACKNOWLEDG")):
+                for owner, repo in _GITHUB_REPO_RE.findall(text):
+                    hits.append((f"{owner}/{repo}", f"listed in {source}", source))
+        deduped: dict[str, tuple[str, str, str]] = {}
+        for owner_repo, context, source in hits:
+            deduped.setdefault(owner_repo.lower(), (owner_repo, context, source))
+        return list(deduped.values())
+
+    def _plain_repo_links(self, bundle: RepositoryEvidenceBundle) -> list[str]:
+        if not bundle.readme:
+            return []
+        attributed = {name.lower() for name, _, _ in self._attribution_hits(bundle)}
+        found: dict[str, str] = {}
+        for owner, repo in _GITHUB_REPO_RE.findall(bundle.readme):
+            key = f"{owner}/{repo}".lower()
+            if key == bundle.full_name.lower() or key in attributed:
+                continue
+            if owner.lower() in {"sponsors", "features", "topics", "orgs", "apps", "marketplace", "shields"}:
+                continue
+            found.setdefault(key, f"{owner}/{repo}")
+        return list(found.values())[:15]
+
+    def _collect_manifests(self, client: GitHubClient, bundle: RepositoryEvidenceBundle) -> None:
+        """§6.3 Dependency Evidence. §9.1: what is read here is dependency, not ancestry.
+
+        The one ancestry signal a manifest carries is a ``repository`` URL pointing
+        somewhere *else* — the classic un-updated fork fingerprint.
+        """
+        present = {item["path"] for item in bundle.tree if item.get("type") == "blob"}
+        for name in _MANIFEST_FILES:
+            if name not in present:
+                continue
+            text = client.file_text(bundle.full_name, name)
+            if text:
+                bundle.manifests[name] = text
+
+        if bundle.summary.dependency_manifests:
+            bundle.add(
+                EvidenceKind.DEPENDENCY_EVIDENCE,
+                "manifests.present",
+                ", ".join(bundle.summary.dependency_manifests[:8]),
+                weight=0.3,
+                supports=[OriginType.ORIGINAL_WITH_DEPENDENCIES],
+                count=len(bundle.summary.dependency_manifests),
+            )
+
+        for name, text in bundle.manifests.items():
+            for owner_repo in _manifest_repository_urls(name, text):
+                if owner_repo.lower() == bundle.full_name.lower():
+                    continue
+                bundle.add(
+                    EvidenceKind.DEPENDENCY_EVIDENCE,
+                    "manifest.repository_mismatch",
+                    f"{name} declares repository {owner_repo}, not {bundle.full_name}",
+                    weight=0.7,
+                    supports=[OriginType.DERIVATIVE_PROJECT, OriginType.DETACHED_FORK],
+                )
+                bundle.candidates.append(
+                    UpstreamCandidate(
+                        full_name=owner_repo,
+                        discovered_via="manifest_repository_mismatch",
+                        confidence=0.7,
+                        notes=f"{name} still points at {owner_repo}",
+                    )
+                )
+
+    def _discover_candidates(self, bundle: RepositoryEvidenceBundle) -> None:
+        """§22 step 10. Search is the *last* resort — it is the weakest channel."""
+        deduped: dict[str, UpstreamCandidate] = {}
+        for candidate in bundle.candidates:
+            key = candidate.full_name.lower()
+            existing = deduped.get(key)
+            if existing is None or candidate.confidence > existing.confidence:
+                deduped[key] = candidate
+        bundle.candidates = sorted(deduped.values(), key=lambda c: -c.confidence)
+        if bundle.upstream_candidates:
+            bundle.add(
+                EvidenceKind.GITHUB_METADATA,
+                "candidates.discovered",
+                ", ".join(f"{c.full_name} ({c.discovered_via})" for c in bundle.upstream_candidates[:5]),
+                weight=0.3,
+                count=len(bundle.upstream_candidates),
+            )
+
+    def _compare_with_candidate(self, client: GitHubClient, bundle: RepositoryEvidenceBundle) -> None:
+        """Shallow structural comparison against the best candidate.
+
+        Path overlap is a *weak* signal and is labelled as such: it says the two
+        repositories have the same shape, not that they share content. It feeds the
+        contribution range only with the widest measurement margin, and it can never
+        outrank commit or blob evidence (§7.2).
+        """
+        candidates = bundle.upstream_candidates
+        if not candidates:
+            return
+        best = candidates[0]
+        own_paths = _comparable_paths(bundle.summary)
+        if len(own_paths) < _MIN_PATHS_FOR_OVERLAP:
+            bundle.deep_notes.append("too few effective paths for a meaningful shallow comparison")
+            return
+        try:
+            candidate_meta = client.repo(best.full_name)
+            candidate_tree = client.tree(
+                best.full_name, candidate_meta.get("default_branch") or "HEAD", recursive=True
+            )
+        except (NotFound, GitHubError) as exc:
+            bundle.add(
+                EvidenceKind.GITHUB_METADATA,
+                "candidate.unreachable",
+                f"{best.full_name}: {str(exc)[:160]}",
+                weight=0.0,
+            )
+            return
+
+        candidate_summary = classify_paths(candidate_tree, config=self.cfg)
+        candidate_paths = _comparable_paths(candidate_summary)
+        if len(candidate_paths) < _MIN_PATHS_FOR_OVERLAP:
+            return
+        overlap = overlap_coefficient(own_paths, candidate_paths)
+        best.similarity.text = round(overlap, 4)
+        bundle.add(
+            EvidenceKind.FILE_EVIDENCE,
+            "similarity.path_overlap",
+            f"{overlap:.3f} against {best.full_name}",
+            weight=0.35,
+            method="path_overlap",
+            note="directory structure only; not evidence of identical content",
+            own_paths=len(own_paths),
+            candidate_paths=len(candidate_paths),
+        )
+        if bundle.upstream_retained_files is None:
+            bundle.upstream_retained_files = overlap
+            bundle.measurement = "shallow"
+
+    # -- §22 steps 4-7: deep comparison ------------------------------------
+
+    def _deep_compare(self, bundle: RepositoryEvidenceBundle) -> None:
+        """Mirror the repository and, when worthwhile, its best candidate (§21).
+
+        Everything here is read-only object inspection of a bare mirror. No working
+        tree is ever materialised, so no repository-controlled code can run.
+        """
+        gitlocal.assert_safe(self.cfg)
+        workspace = self.core.workspace_for(bundle.repository_id)
+        size_kb = int(bundle.metadata.get("size") or 0)
+        try:
+            clone = gitlocal.mirror_clone(
+                bundle.full_name, workspace, config=self.cfg, size_kb=size_kb, refresh=False
+            )
+        except gitlocal.GitError as exc:
+            bundle.deep_notes.append(f"mirror clone failed: {exc}")
+            bundle.add(EvidenceKind.GIT_METADATA, "deep.clone_failed", str(exc)[:200], weight=0.0)
+            return
+
+        own_commits = gitlocal.commit_shas(clone)
+        own_roots = gitlocal.root_commits(clone)
+        head = gitlocal.default_head(clone)
+        own_blobs = gitlocal.blob_entries(clone, head) if head else []
+        bundle.add(
+            EvidenceKind.GIT_METADATA,
+            "git.history",
+            f"{len(own_commits)} commits, {len(own_roots)} root commit(s), {len(own_blobs)} blobs at {head}",
+            weight=0.4,
+            commits=len(own_commits),
+            roots=sorted(own_roots)[:5],
+            blobs=len(own_blobs),
+        )
+        submodules = gitlocal.submodule_urls(clone, head) if head else []
+        if submodules:
+            bundle.add(
+                EvidenceKind.GIT_METADATA,
+                "git.submodules",
+                ", ".join(submodules[:5]),
+                weight=0.4,
+                supports=[OriginType.MULTI_SOURCE_COMPOSITE],
+            )
+            for owner, repo in _GITHUB_REPO_RE.findall(" ".join(submodules)):
+                bundle.candidates.append(
+                    UpstreamCandidate(
+                        full_name=f"{owner}/{repo}",
+                        discovered_via="submodule_url",
+                        confidence=0.5,
+                        notes="declared as a git submodule",
+                    )
+                )
+            self._discover_candidates(bundle)
+
+        candidates = bundle.upstream_candidates
+        if not candidates:
+            bundle.deep_notes.append("no upstream candidate to compare against")
+            bundle.measurement = "commit_graph"
+            return
+
+        best = candidates[0]
+        if not gitlocal.add_comparison_remote(clone, best.full_name):
+            bundle.deep_notes.append(f"could not fetch candidate {best.full_name}")
+            bundle.add(
+                EvidenceKind.GIT_METADATA,
+                "deep.candidate_unfetchable",
+                best.full_name,
+                weight=0.0,
+            )
+            return
+
+        upstream_commits = gitlocal.commit_shas(clone, ref="--remotes=upstream")
+        upstream_roots = gitlocal.root_commits(clone, ref="--remotes=upstream")
+        s_commit = commit_similarity(own_commits, upstream_commits)
+        shared_root = bool(own_roots & upstream_roots)
+        best.similarity.commit = round(s_commit, 4)
+        best.shared_root_commit = shared_root
+        bundle.add(
+            EvidenceKind.GIT_METADATA,
+            "similarity.commit",
+            f"{s_commit:.3f} against {best.full_name}",
+            weight=0.9,
+            supports=[OriginType.DETACHED_FORK, OriginType.GITHUB_FORK] if s_commit >= 0.3 else [],
+            shared_root_commit=shared_root,
+            own_commits=len(own_commits),
+            upstream_commits=len(upstream_commits),
+            local_unique_commits=len(own_commits - upstream_commits),
+        )
+        if head:
+            upstream_ref = gitlocal.resolve_ref(
+                clone,
+                ["refs/remotes/upstream/main", "refs/remotes/upstream/master", "refs/remotes/upstream/HEAD"],
+            )
+            if upstream_ref:
+                base = gitlocal.merge_base(clone, head, upstream_ref)
+                best.merge_base = base
+                if base:
+                    bundle.add(
+                        EvidenceKind.GIT_METADATA,
+                        "git.merge_base",
+                        base,
+                        weight=0.95,
+                        supports=[OriginType.DETACHED_FORK, OriginType.GITHUB_FORK],
+                    )
+                upstream_blobs = gitlocal.blob_entries(clone, upstream_ref)
+                self._blob_evidence(bundle, best, own_blobs, upstream_blobs)
+
+        if bundle.measurement != "blob_exact":
+            # Blob comparison did not run (no comparable upstream ref). Commit overlap
+            # is a coarser proxy for retention and is labelled as such, so the
+            # contribution interval widens accordingly.
+            bundle.measurement = "commit_graph"
+            if bundle.upstream_retained_files is None and s_commit > 0:
+                bundle.upstream_retained_files = s_commit
+        # §7.3 mirror-detection: tracks upstream with essentially no local commits.
+        bundle.git_facts["local_unique_commits"] = len(own_commits - upstream_commits)
+        bundle.git_facts["sync_pattern"] = bool(
+            upstream_commits and len(own_commits - upstream_commits) <= 3 and s_commit >= 0.9
+        )
+
+    def _blob_evidence(
+        self,
+        bundle: RepositoryEvidenceBundle,
+        candidate: UpstreamCandidate,
+        own_blobs: Sequence[gitlocal.BlobEntry],
+        upstream_blobs: Sequence[gitlocal.BlobEntry],
+    ) -> None:
+        """§7.1 S_blob over *effective* content only — §9.1 applied to blobs too."""
+        classified = {file.path: file.component_class for file in bundle.summary.files}
+        own_effective = [
+            b
+            for b in own_blobs
+            if classified.get(b.path, ComponentClass.UNKNOWN) not in _NON_EFFECTIVE
+        ]
+        if not own_effective or not upstream_blobs:
+            return
+        upstream_shas = {b.sha for b in upstream_blobs}
+        upstream_paths = {b.path for b in upstream_blobs}
+        own_shas = {b.sha for b in own_effective}
+
+        s_blob = blob_similarity(own_shas, upstream_shas)
+        candidate.similarity.blob = round(s_blob, 4)
+
+        retained = [b for b in own_effective if b.sha in upstream_shas]
+        retained_files = len(retained) / len(own_effective)
+        own_bytes = sum(b.size for b in own_effective) or 1
+        retained_bytes = sum(b.size for b in retained) / own_bytes
+        # "Same path, different content" is the modified-upstream population; it is
+        # what §8.2 转化深度 measures against.
+        shared_path_files = [b for b in own_effective if b.path in upstream_paths]
+        modified = [b for b in shared_path_files if b.sha not in upstream_shas]
+        if shared_path_files:
+            bundle.upstream_modified_ratio = len(modified) / len(shared_path_files)
+
+        bundle.upstream_retained_files = retained_files
+        bundle.upstream_retained_bytes = retained_bytes
+        bundle.measurement = "blob_exact"
+        bundle.add(
+            EvidenceKind.CODE_EVIDENCE,
+            "similarity.blob",
+            f"{s_blob:.3f} against {candidate.full_name}",
+            weight=0.85,
+            supports=[OriginType.DERIVATIVE_PROJECT] if s_blob >= 0.6 else [],
+            retained_effective_files=len(retained),
+            effective_files_compared=len(own_effective),
+            retained_by_files=round(retained_files, 4),
+            retained_by_bytes=round(retained_bytes, 4),
+            modified_shared_path_files=len(modified),
+        )
+
+    # -- §22 step 11-14: facts, verdict, labels ----------------------------
+
+    def build_facts(self, bundle: RepositoryEvidenceBundle) -> dict[str, Any]:
+        """Flatten every observation into the dictionary the YAML rules see.
+
+        A fact is present only when it was actually measured. Nothing defaults to
+        ``False`` or ``0``: a rule must not be able to fire on the absence of a
+        measurement (§29 "每個判定有證據與信心").
+        """
+        meta = bundle.metadata
+        summary = bundle.summary
+        facts: dict[str, Any] = {"analysis.completed": True, "analysis.deep": bundle.deep}
+
+        facts["github.fork"] = bool(meta.get("fork"))
+        facts["github.parent.exists"] = bool((meta.get("parent") or {}).get("full_name"))
+        facts["github.source.exists"] = bool((meta.get("source") or {}).get("full_name"))
+        facts["github.template.exists"] = bool((meta.get("template_repository") or {}).get("full_name"))
+        facts["github.archived"] = bool(meta.get("archived"))
+        facts["github.is_template"] = bool(meta.get("is_template"))
+        facts["repo.size_kb"] = int(meta.get("size") or 0)
+        facts["repo.default_branch"] = meta.get("default_branch") or "HEAD"
+        facts["repo.license_spdx"] = ((meta.get("license") or {}).get("spdx_id") or "NOASSERTION")
+
+        facts["tree.total_files"] = summary.total_files
+        facts["tree.effective_files"] = summary.effective_files
+        facts["tree.effective_ratio"] = round(summary.effective_file_ratio, 4)
+        facts["tree.dependency_files"] = summary.dependency_files
+        facts["tree.vendored_files"] = summary.vendored_files
+        facts["tree.generated_files"] = summary.generated_files
+        facts["tree.vendored_ratio"] = round(
+            (summary.vendored_files / summary.total_files) if summary.total_files else 0.0, 4
+        )
+        facts["tree.dependency_ratio"] = round(
+            (summary.dependency_files / summary.total_files) if summary.total_files else 0.0, 4
+        )
+        facts["tree.has_dependency_manifest"] = bool(summary.dependency_manifests)
+        facts["tree.has_lockfile"] = bool(summary.lock_files)
+        facts["tree.has_embedded_license"] = bool(summary.embedded_license_files)
+        facts["tree.truncated"] = bundle.tree_truncated
+
+        upstream = bundle.upstream_candidates
+        facts["candidates.count"] = len(upstream)
+        facts["candidates.best_confidence"] = round(upstream[0].confidence, 4) if upstream else 0.0
+
+        attribution = [
+            e for e in bundle.evidence if e.key.startswith("attribution.")
+        ]
+        facts["attribution.detected"] = bool(attribution)
+        facts["attribution.upstream_count"] = len(
+            {e.value.split(" — ")[0] for e in attribution}
+        )
+        facts["attribution.explicit_fork_statement"] = any(
+            _FORK_STATEMENT_RE.search(e.value) for e in attribution
+        ) or bool(
+            bundle.readme and _FORK_STATEMENT_RE.search(bundle.readme.split("\n\n")[0] if bundle.readme else "")
+            and upstream
+        )
+
+        facts["template_signature.detected"] = facts["github.template.exists"]
+        if facts["github.template.exists"] and bundle.upstream_retained_files is not None:
+            facts["template_files_removed_or_modified"] = bundle.upstream_retained_files < 0.90
+
+        facts["plugin.signature_detected"] = _plugin_signature(bundle)
+        facts["generated.scaffold_detected"] = _scaffold_signature(bundle)
+
+        best = upstream[0] if upstream else None
+        if best is not None:
+            if best.similarity.commit is not None:
+                facts["similarity.commit"] = best.similarity.commit
+            if best.similarity.blob is not None:
+                facts["similarity.blob"] = best.similarity.blob
+            if best.similarity.text is not None:
+                facts["similarity.path"] = best.similarity.text
+            if best.similarity.token is not None:
+                facts["similarity.token"] = best.similarity.token
+            if bundle.deep:
+                facts["common_root_commit"] = bool(best.shared_root_commit)
+        if "local_unique_commits" in bundle.license_detail:
+            facts["local_unique_commits"] = bundle.license_detail["local_unique_commits"]
+        if "sync_pattern" in bundle.license_detail:
+            facts["sync_pattern.detected"] = bundle.license_detail["sync_pattern"]
+        if bundle.upstream_retained_files is not None:
+            facts["upstream_retained"] = round(bundle.upstream_retained_files, 4)
+            facts["local_contribution"] = round(1.0 - bundle.upstream_retained_files, 4)
+
+        facts["license.status"] = str(bundle.license_status)
+        return facts
+
+    def _build_profile(
+        self,
+        bundle: RepositoryEvidenceBundle,
+        facts: Mapping[str, Any],
+        evaluation: RuleEvaluation,
+    ) -> OriginProfile:
+        origin_type = evaluation.origin_type
+        confidence = evaluation.confidence
+
+        # §29: "每個判定有證據與信心". A verdict resting on nothing observable is not a
+        # verdict, whatever the rules concluded.
+        substantive = [e for e in bundle.evidence if e.weight > 0.0]
+        if not substantive:
+            origin_type = OriginType.UNKNOWN
+            confidence = 0.0
+            evaluation.notes.append("no substantive evidence gathered; verdict forced to UNKNOWN")
+
+        contribution = self._estimate(bundle, origin_type, confidence)
+        components = self._component_rows(bundle, origin_type)
+        public, review_status = _public_label(
+            origin_type=origin_type,
+            confidence=confidence,
+            bundle=bundle,
+            contribution=contribution,
+        )
+
+        for note in evaluation.notes:
+            bundle.add(EvidenceKind.GITHUB_METADATA, "rule.note", note, weight=0.0)
+        for note in bundle.deep_notes:
+            bundle.add(EvidenceKind.GIT_METADATA, "deep.note", note, weight=0.0)
+        if evaluation.matched:
+            bundle.add(
+                EvidenceKind.GITHUB_METADATA,
+                "rule.matched",
+                f"{evaluation.matched.id} ({evaluation.matched.signal_tier}) → {evaluation.origin_type}",
+                weight=0.0,
+                tier=evaluation.matched.signal_tier,
+                conditions=dict(evaluation.matched.when),
+            )
+
+        return OriginProfile(
+            id=f"orp_{bundle.repository_id}",
+            repository_id=bundle.repository_id,
+            origin_type=origin_type,
+            origin_confidence=round(confidence, 4),
+            matched_rule=evaluation.matched_rule_id,
+            evidence=bundle.evidence,
+            upstream_candidates=bundle.candidates,
+            components=components,
+            contribution=contribution,
+            license_status=bundle.license_status,
+            public=public,
+            review_status=review_status,
+        )
+
+    def _estimate(
+        self, bundle: RepositoryEvidenceBundle, origin_type: OriginType, confidence: float
+    ) -> ContributionEstimate:
+        return estimate_contribution(
+            bundle.summary,
+            origin_type=origin_type,
+            origin_confidence=confidence,
+            upstream_retained=bundle.upstream_retained_files,
+            upstream_retained_bytes=bundle.upstream_retained_bytes,
+            upstream_modified_ratio=bundle.upstream_modified_ratio,
+            measurement=bundle.measurement,
+        )
+
+    def _component_rows(
+        self, bundle: RepositoryEvidenceBundle, origin_type: OriginType
+    ) -> list[ComponentProfile]:
+        """Promote UNKNOWN components to ORIGINAL only once no upstream exists.
+
+        This is axiom 4 at file granularity: unclassified content is called original
+        only when the engine has positively established there is nothing it could
+        have come from.
+        """
+        rows = bundle.summary.to_profiles()
+        no_upstream = not bundle.upstream_candidates and origin_type in {
+            OriginType.ORIGINAL,
+            OriginType.ORIGINAL_WITH_DEPENDENCIES,
+            OriginType.PLUGIN_OR_EXTENSION,
+        }
+        if not no_upstream:
+            return rows
+        return [
+            row.model_copy(
+                update={
+                    "component_class": ComponentClass.ORIGINAL,
+                    "reason": "no upstream candidate found for this repository",
+                }
+            )
+            if row.component_class is ComponentClass.UNKNOWN
+            else row
+            for row in rows
+        ]
+
+    # -- §10 license -------------------------------------------------------
+
+    def _analyze_license(self, bundle: RepositoryEvidenceBundle) -> None:
+        """§10 licence model. Advisory only — §25 forbids emitting a legal conclusion."""
+        summary = bundle.summary
+        spdx = ((bundle.metadata.get("license") or {}).get("spdx_id") or "").upper()
+        embedded = summary.embedded_license_files
+        detail: dict[str, Any] = {
+            "repository_license": spdx or None,
+            "embedded_license_files": embedded[:20],
+            "attribution_files": summary.attribution_files[:20],
+            "vendored_files": summary.vendored_files,
+        }
+
+        copyleft_texts = [
+            name
+            for name, text in bundle.documents.items()
+            if any(token in text.lower() for token in _COPYLEFT_TOKENS)
+        ]
+        repo_is_permissive = spdx in _PERMISSIVE_SPDX
+        repo_is_copyleft = any(spdx.startswith(prefix) for prefix in _COPYLEFT_SPDX_PREFIXES)
+
+        if not spdx or spdx in {"NOASSERTION", "NONE"}:
+            status = LicenseStatus.UNKNOWN
+            reason = "no SPDX licence detected on the repository"
+        elif embedded and repo_is_permissive and copyleft_texts:
+            status = LicenseStatus.COPYLEFT_TRIGGERED
+            reason = (
+                f"copyleft text found in {', '.join(copyleft_texts)} while the repository "
+                f"declares the permissive licence {spdx}"
+            )
+        elif embedded:
+            status = LicenseStatus.REVIEW_REQUIRED
+            reason = f"{len(embedded)} embedded licence file(s) outside the repository root"
+        elif summary.vendored_files and not embedded:
+            status = LicenseStatus.REVIEW_REQUIRED
+            reason = f"{summary.vendored_files} vendored file(s) carry no licence file"
+        elif bundle.upstream_candidates and repo_is_permissive:
+            status = LicenseStatus.ATTRIBUTION_REQUIRED
+            reason = "an upstream candidate exists; upstream attribution should be verified"
+        elif summary.attribution_files:
+            status = LicenseStatus.NOTICE_REQUIRED
+            reason = f"attribution file(s) present: {', '.join(summary.attribution_files[:3])}"
+        elif repo_is_copyleft:
+            status = LicenseStatus.NOTICE_REQUIRED
+            reason = f"repository declares the copyleft licence {spdx}"
+        else:
+            status = LicenseStatus.CLEAR
+            reason = f"repository licence {spdx}, no embedded or vendored sources detected"
+
+        detail["reason"] = reason
+        bundle.license_status = status
+        bundle.license_detail.update(detail)
+        bundle.add(
+            EvidenceKind.FILE_EVIDENCE,
+            "license.status",
+            f"{status}: {reason}",
+            weight=0.3,
+            advisory=True,
+            note="advisory only; not a legal conclusion (§25)",
+            **{k: v for k, v in detail.items() if k != "reason"},
+        )
+        self._save_license_profile(bundle, status, detail)
+
+    def _save_license_profile(
+        self, bundle: RepositoryEvidenceBundle, status: LicenseStatus, detail: Mapping[str, Any]
+    ) -> None:
+        if self._repository_row(bundle.full_name) is None:
+            return  # inventory not synced; §20 rows would violate the foreign key
+        upsert(
+            self.core.conn,
+            "license_profiles",
+            {
+                "id": f"lic_{bundle.repository_id}",
+                "repository_id": bundle.repository_id,
+                "repository_license": detail.get("repository_license"),
+                "embedded_sources": dumps(detail.get("embedded_license_files", [])),
+                "dependencies": dumps(bundle.summary.dependency_manifests),
+                "assets": dumps([]),
+                "compatibility_status": str(status),
+                "created_at": _now().isoformat(),
+            },
+            ["id"],
+        )
+        self.core.conn.commit()
+
+    # -- persistence helpers ----------------------------------------------
+
+    @staticmethod
+    def _row_to_profile(conn: sqlite3.Connection, row: sqlite3.Row) -> OriginProfile:
+        candidates = [
+            UpstreamCandidate(
+                full_name=c["full_name"],
+                discovered_via=c["discovered_via"],
+                similarity=SimilarityVector(**loads(c["similarity"], {})),
+                shared_root_commit=bool(c["shared_root_commit"]),
+                merge_base=c["merge_base"],
+                confidence=c["confidence"],
+                notes=c["notes"],
+            )
+            for c in conn.execute(
+                "SELECT * FROM upstream_candidates WHERE origin_profile_id = ?", (row["id"],)
+            )
+        ]
+        components = [
+            ComponentProfile(
+                path=c["path"],
+                component_class=ComponentClass(c["component_class"]),
+                bytes=c["bytes"],
+                files=c["files"],
+                reason=c["reason"],
+            )
+            for c in conn.execute(
+                "SELECT * FROM component_profiles WHERE origin_profile_id = ?", (row["id"],)
+            )
+        ]
+        contribution = ContributionEstimate(
+            upstream_retained_min=row["upstream_retained_min"],
+            upstream_retained_max=row["upstream_retained_max"],
+            local_contribution_min=row["local_contribution_min"],
+            local_contribution_max=row["local_contribution_max"],
+            transformation_score=row["transformation_score"],
+            band=ContributionBand(row["contribution_band"] or "UNKNOWN"),
+            confidence=Confidence(row["contribution_confidence"] or "LOW"),
+            per_dimension=loads(row["per_dimension"], {}),
+        )
+        return OriginProfile(
+            id=row["id"],
+            repository_id=row["repository_id"],
+            origin_type=OriginType(row["origin_type"]),
+            origin_confidence=row["origin_confidence"],
+            matched_rule=row["matched_rule"],
+            evidence=[Evidence(**e) for e in loads(row["evidence"], [])],
+            upstream_candidates=candidates,
+            components=components,
+            contribution=contribution,
+            license_status=LicenseStatus(row["license_status"]),
+            public=PublicLabel(
+                label=row["public_label"] or _PUBLIC_LABELS[OriginType.UNKNOWN],
+                attribution=row["public_attribution"],
+                originality_claim=row["public_originality_claim"],
+            ),
+            review_status=ReviewStatus(row["review_status"]),
+            reviewed_by=row["reviewed_by"],
+            created_at=datetime.fromisoformat(row["created_at"]),
+            updated_at=datetime.fromisoformat(row["updated_at"]),
+        )
+
+
+_NON_EFFECTIVE = {
+    ComponentClass.DEPENDENCY,
+    ComponentClass.VENDORED,
+    ComponentClass.VENDORED_MODIFIED,
+    ComponentClass.GENERATED,
+    ComponentClass.BINARY,
+}
+
+
+# --------------------------------------------------------------------------
+# §23 public/internal separation
+# --------------------------------------------------------------------------
+
+def _public_label(
+    *,
+    origin_type: OriginType,
+    confidence: float,
+    bundle: RepositoryEvidenceBundle,
+    contribution: ContributionEstimate,
+) -> tuple[PublicLabel, ReviewStatus]:
+    """Derive the outward-facing label. The single gate for axiom 4.
+
+    Three independent tests must all pass before any originality claim is emitted:
+    the origin type must not be in :data:`NO_AUTOMATIC_ORIGINALITY_CLAIM`, the
+    confidence must clear :data:`ORIGINALITY_CLAIM_THRESHOLD`, and the origin type
+    must appear in :data:`_CLAIMABLE`. Anything else is ``"none"`` plus
+    ``NEEDS_REVIEW`` — the conservative answer is always reachable, and it is the
+    default.
+    """
+    upstream = bundle.upstream_candidates
+    attribution = f"Based on {upstream[0].full_name}" if upstream else None
+
+    forbidden = origin_type in NO_AUTOMATIC_ORIGINALITY_CLAIM
+    under_confident = confidence < ORIGINALITY_CLAIM_THRESHOLD
+    claim = _CLAIMABLE.get(origin_type)
+
+    if forbidden or under_confident or claim is None:
+        label = PublicLabel(
+            label=_PUBLIC_LABELS.get(origin_type, _PUBLIC_LABELS[OriginType.UNKNOWN]),
+            attribution=attribution,
+            originality_claim="none",
+        )
+        return label, ReviewStatus.NEEDS_REVIEW
+
+    # A claim is permitted. §8.1 still forbids publishing a bare percentage, so the
+    # band — never the number — is what accompanies it.
+    if claim == "original" and contribution.band in {
+        ContributionBand.MINIMAL,
+        ContributionBand.LIMITED,
+        ContributionBand.UNKNOWN,
+    }:
+        # The origin says "original" but the measurement disagrees. Defer to a human
+        # rather than publish a claim the contribution range does not support.
+        return (
+            PublicLabel(
+                label=_PUBLIC_LABELS.get(origin_type, _PUBLIC_LABELS[OriginType.UNKNOWN]),
+                attribution=attribution,
+                originality_claim="none",
+            ),
+            ReviewStatus.NEEDS_REVIEW,
+        )
+
+    label = PublicLabel(
+        label=_PUBLIC_LABELS.get(origin_type, _PUBLIC_LABELS[OriginType.UNKNOWN]),
+        attribution=attribution,
+        originality_claim=claim,
+    )
+    if bundle.license_status in {
+        LicenseStatus.COPYLEFT_TRIGGERED,
+        LicenseStatus.INCOMPATIBLE,
+        LicenseStatus.REVIEW_REQUIRED,
+    }:
+        return label, ReviewStatus.LEGAL_REVIEW_REQUESTED
+    return label, ReviewStatus.UNREVIEWED
+
+
+# --------------------------------------------------------------------------
+# signature helpers
+# --------------------------------------------------------------------------
+
+def _comparable_paths(summary: ComponentSummary) -> set[str]:
+    """Effective paths minus the ones every repository has (§9 applied first).
+
+    Without this filter two unrelated small projects both containing ``README.md``,
+    ``.gitignore`` and ``src/index.js`` would show a non-trivial overlap.
+    """
+    return {path for path in summary.effective_paths() if path.lower() not in _UNIVERSAL_PATHS}
+
+
+def _manifest_repository_urls(name: str, text: str) -> list[str]:
+    """Repository URLs declared *by the package itself*, not its dependencies."""
+    found: list[str] = []
+    lowered = name.lower()
+    if lowered in {"package.json", "composer.json", "deno.json", "manifest.json"}:
+        try:
+            data = json.loads(text)
+        except (json.JSONDecodeError, ValueError):
+            return []
+        if not isinstance(data, dict):
+            return []
+        blob = ""
+        repository = data.get("repository")
+        if isinstance(repository, str):
+            blob += repository + " "
+        elif isinstance(repository, dict):
+            blob += str(repository.get("url", "")) + " "
+        blob += str(data.get("homepage", "")) + " "
+        found.extend(f"{owner}/{repo}" for owner, repo in _GITHUB_REPO_RE.findall(blob))
+    elif lowered in {"pyproject.toml", "cargo.toml"}:
+        # Deliberately regex, not a TOML parse: only the [project.urls] /
+        # [package] neighbourhood matters and a malformed manifest must not raise.
+        for line in text.splitlines():
+            stripped = line.strip().lower()
+            if stripped.startswith(("repository", "homepage", "source", "url")):
+                found.extend(f"{owner}/{repo}" for owner, repo in _GITHUB_REPO_RE.findall(line))
+    elif lowered == "go.mod":
+        for line in text.splitlines():
+            if line.strip().startswith("module "):
+                found.extend(f"{owner}/{repo}" for owner, repo in _GITHUB_REPO_RE.findall(line))
+    deduped: dict[str, str] = {}
+    for item in found:
+        deduped.setdefault(item.lower(), item)
+    return list(deduped.values())
+
+
+def _plugin_signature(bundle: RepositoryEvidenceBundle) -> bool:
+    """Does the repository declare itself an extension of a host platform?
+
+    §9.1 in miniature: writing a plugin *for* something is a dependency relationship,
+    never descent from it, so this signal must not create an upstream candidate.
+    """
+    manifest = bundle.manifests.get("manifest.json")
+    if manifest:
+        try:
+            data = json.loads(manifest)
+            if isinstance(data, dict) and ("manifest_version" in data or "minAppVersion" in data):
+                return True
+        except (json.JSONDecodeError, ValueError):
+            pass
+    package = bundle.manifests.get("package.json")
+    if package:
+        lowered = package.lower()
+        if '"contributes"' in lowered or '"vscode"' in lowered:
+            return True
+        if any(hint in lowered for hint in _PLUGIN_HINTS):
+            return True
+    pyproject = bundle.manifests.get("pyproject.toml", "")
+    if "entry-points" in pyproject.lower() and any(h in pyproject.lower() for h in _PLUGIN_HINTS):
+        return True
+    topics = {str(t).lower() for t in (bundle.metadata.get("topics") or [])}
+    return bool(topics & {"plugin", "extension", "chrome-extension", "vscode-extension", "obsidian-plugin", "addon"})
+
+
+def _scaffold_signature(bundle: RepositoryEvidenceBundle) -> bool:
+    text = (bundle.readme or "").lower()
+    return any(marker in text for marker in _SCAFFOLD_MARKERS)
+
+
+# --------------------------------------------------------------------------
+# §22 step 12: evidence report
+# --------------------------------------------------------------------------
+
+def render_report(full_name: str, profile: OriginProfile) -> str:
+    """Human-readable evidence report. Internal view first, public view last (§23)."""
+    lines: list[str] = [
+        f"# Origin & Provenance Report — {full_name}",
+        "",
+        f"*Generated {_now().isoformat(timespec='seconds')} · profile `{profile.id}`*",
+        "",
+        "## Verdict (internal)",
+        "",
+        f"- **Origin type**: `{profile.origin_type}`",
+        f"- **Confidence**: {profile.origin_confidence:.2f}",
+        f"- **Matched rule**: `{profile.matched_rule or 'none'}`",
+        f"- **Review status**: `{profile.review_status}`",
+        f"- **License status**: `{profile.license_status}` (advisory only — not a legal conclusion, §25)",
+        "",
+        "## Contribution estimate (§8 — range, never a single score)",
+        "",
+        "```text",
+        describe_contribution(profile.contribution),
+        "```",
+        "",
+    ]
+    contribution = profile.contribution
+    if contribution.upstream_retained_min is not None:
+        lines.append(
+            f"- Upstream retained: {contribution.upstream_retained_min:.2f}–"
+            f"{contribution.upstream_retained_max:.2f}"
+        )
+    if contribution.transformation_score is not None:
+        lines.append(f"- Transformation depth: {contribution.transformation_score:.2f}")
+    lines.append("")
+
+    lines.append("## Upstream candidates (§22 step 10)")
+    lines.append("")
+    if profile.upstream_candidates:
+        lines.append("| Repository | Discovered via | Confidence | S_commit | S_blob | Shared root |")
+        lines.append("| --- | --- | ---: | ---: | ---: | --- |")
+        for candidate in profile.upstream_candidates:
+            sim = candidate.similarity
+            lines.append(
+                f"| `{candidate.full_name}` | {candidate.discovered_via} | {candidate.confidence:.2f} | "
+                f"{_fmt(sim.commit)} | {_fmt(sim.blob)} | {'yes' if candidate.shared_root_commit else 'no'} |"
+            )
+    else:
+        lines.append("_No upstream candidate found._")
+    lines.append("")
+
+    lines.append("## Component separation (§9.1 dependency ≠ upstream ≠ vendored)")
+    lines.append("")
+    if profile.components:
+        lines.append("| Path | Class | Files | Bytes | Why |")
+        lines.append("| --- | --- | ---: | ---: | --- |")
+        for component in profile.components[:25]:
+            lines.append(
+                f"| `{component.path}` | {component.component_class} | {component.files} | "
+                f"{component.bytes} | {component.reason or ''} |"
+            )
+        if len(profile.components) > 25:
+            lines.append(f"| … | | | | {len(profile.components) - 25} more groups |")
+    else:
+        lines.append("_No component classification recorded._")
+    lines.append("")
+
+    lines.append("## Evidence (§6.3)")
+    lines.append("")
+    lines.append("| Kind | Key | Value | Weight | Supports |")
+    lines.append("| --- | --- | --- | ---: | --- |")
+    for item in sorted(profile.evidence, key=lambda e: -e.weight):
+        supports = ", ".join(str(s) for s in item.supports) or "—"
+        value = item.value.replace("|", "\\|")[:180]
+        lines.append(f"| {item.kind} | `{item.key}` | {value} | {item.weight:.2f} | {supports} |")
+    lines.append("")
+
+    public = profile.public
+    lines.extend(
+        [
+            "## Public view (§23.2)",
+            "",
+            "```yaml",
+            "public:",
+            f"  label: {public.label if public else 'Origin under review'}",
+            f"  attribution: {public.attribution if public and public.attribution else 'null'}",
+            f"  originality_claim: {public.originality_claim if public else 'none'}",
+            "```",
+            "",
+        ]
+    )
+    if not public or public.originality_claim == "none":
+        lines.append(
+            "> Axiom 4: no automatic originality claim is made for this repository. "
+            "A human reviewer must decide what, if anything, is claimed publicly."
+        )
+    return "\n".join(lines)
+
+
+def _fmt(value: float | None) -> str:
+    return f"{value:.3f}" if value is not None else "—"
