@@ -88,6 +88,7 @@ def sync(
     config: Optional[str] = typer.Option(None, "--config", "-c"),
     readme: bool = typer.Option(True, help="Fetch README text (one extra API call per repo)."),
     languages: bool = typer.Option(True, help="Fetch language breakdown."),
+    tree: bool = typer.Option(True, help="Fetch the file tree (feeds path evidence)."),
     limit: Optional[int] = typer.Option(None, help="Stop after N repositories."),
 ) -> None:
     """Sync accounts and repositories into the asset inventory (Phase 1)."""
@@ -96,7 +97,7 @@ def sync(
     core = _core(config)
     try:
         result = InventorySync(core).sync_repositories(
-            include_readme=readme, include_languages=languages, limit=limit
+            include_readme=readme, include_languages=languages, include_tree=tree, limit=limit
         )
         console.print(
             f"[green]synced[/green] {result.repositories} repositories across "

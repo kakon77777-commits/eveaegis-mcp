@@ -38,7 +38,7 @@ from ..audit import content_hash
 from ..core import GovernanceCore
 from ..credentials import TokenScope
 from ..db import dumps, iso, loads, upsert
-from ..githubapi import GitHubClient
+from ..githubapi import GitHubClient, NotFound
 from ..models import GitHubInstallation, RepositoryAsset
 from ..taxonomy import (
     AgentAccess,
@@ -173,20 +173,27 @@ class InventorySync:
         *,
         include_readme: bool = True,
         include_languages: bool = True,
+        include_tree: bool = True,
         limit: int | None = None,
     ) -> InventoryResult:
         """Full portfolio sweep: accounts, then every repository they own.
 
-        ``include_readme``/``include_languages`` each cost one extra API call per
-        repository, so they are switches rather than always-on behaviour (§29 asks
-        the system to stay usable at 100+ repositories).
+        ``include_readme``/``include_languages``/``include_tree`` each cost one extra
+        API call per repository, so they are switches rather than always-on behaviour
+        (§29 asks the system to stay usable at 100+ repositories). All three default
+        to on because Phases 2 and 3 read the resulting snapshots offline — a sync
+        that skips them makes the classifier guess from topics alone.
         """
         started = time.monotonic()
         result = InventoryResult()
 
         # Axiom 5: ask for the narrowest scope that satisfies the request. README
         # bodies are content; everything else here is metadata.
-        scope = TokenScope.READ_CONTENT if include_readme else TokenScope.READ_METADATA
+        scope = (
+            TokenScope.READ_CONTENT
+            if (include_readme or include_tree)
+            else TokenScope.READ_METADATA
+        )
 
         with self.core.client(scope, reason="phase 1 inventory sync") as gh:
             credential = gh.credential_description
@@ -199,6 +206,7 @@ class InventorySync:
                 detail={
                     "include_readme": include_readme,
                     "include_languages": include_languages,
+                    "include_tree": include_tree,
                     "limit": limit,
                 },
             )
@@ -223,6 +231,7 @@ class InventorySync:
                         installation_id=installation.id if installation else None,
                         include_readme=include_readme,
                         include_languages=include_languages,
+                        include_tree=include_tree,
                     )
                 except Exception as exc:  # one bad repo must not end the sweep
                     self._record_error(full_name or "<unknown>", exc, result.errors, credential)
@@ -265,6 +274,7 @@ class InventorySync:
                 installation_id=installation.id if installation else None,
                 include_readme=True,
                 include_languages=True,
+                include_tree=True,
             )
             self.core.ledger.record(
                 "inventory_repository_refreshed",
@@ -407,6 +417,7 @@ class InventorySync:
         installation_id: str | None,
         include_readme: bool,
         include_languages: bool,
+        include_tree: bool = True,
     ) -> dict[str, int]:
         rid = repository_id(payload)
         full_name = payload["full_name"]
@@ -440,12 +451,44 @@ class InventorySync:
             readme = gh.readme(full_name)
             if readme is not None:
                 snapshots += int(self._write_snapshot(rid, "readme", readme))
+        if include_tree:
+            tree = self._fetch_tree(gh, payload)
+            if tree is not None:
+                snapshots += int(self._write_snapshot(rid, "tree", tree))
 
         conn.commit()
         return {
             "created": 0 if existing else 1,
             "updated": 1 if existing else 0,
             "snapshots": snapshots,
+        }
+
+    #: Cap on stored tree entries. A handful of repositories carry tens of thousands
+    #: of paths (vendored trees, generated sites); the file markers classification
+    #: and provenance care about all live near the root anyway.
+    MAX_TREE_ENTRIES = 5000
+
+    def _fetch_tree(self, gh: GitHubClient, payload: dict[str, Any]) -> dict[str, Any] | None:
+        """Root tree listing, stored so Phase 2/3 can reason about paths offline.
+
+        Without this, the file-marker evidence family has nothing to read and every
+        repository without obvious topics falls through to UNKNOWN. Empty
+        repositories legitimately have no tree — that is not an error.
+        """
+        ref = payload.get("default_branch") or "HEAD"
+        try:
+            entries = gh.tree(payload["full_name"], ref, recursive=True)
+        except NotFound:
+            return None
+        if not entries:
+            return None
+        return {
+            "ref": ref,
+            "truncated": len(entries) > self.MAX_TREE_ENTRIES,
+            "tree": [
+                {"path": e.get("path"), "type": e.get("type"), "size": e.get("size", 0)}
+                for e in entries[: self.MAX_TREE_ENTRIES]
+            ],
         }
 
     def _reconcile_identity(self, rid: str, full_name: str) -> sqlite3.Row | None:

@@ -249,8 +249,10 @@ rules:
       candidates.count: 0
       attribution.explicit_fork_statement: false
     result:
+      # Ranked just above `original-with-dependencies`: a plugin necessarily has a
+      # manifest, so both match, and "plugin" is the more informative of the two.
       origin_type: PLUGIN_OR_EXTENSION
-      confidence: 0.80
+      confidence: 0.89
       public_label: Plugin or extension
 
   - id: original-with-dependencies
@@ -268,6 +270,27 @@ rules:
     result:
       origin_type: ORIGINAL_WITH_DEPENDENCIES
       confidence: 0.88
+      public_label: Original project
+
+  - id: original-with-credited-sources
+    description: >
+      The repository credits an external project (NOTICE, AUTHORS, acknowledgement)
+      but does not claim descent from it, and its structure barely overlaps that
+      project's. Crediting an inspiration is not derivation — but the confidence is
+      held below the public-claim threshold on purpose, so a human decides what is
+      said publicly rather than the engine.
+    signal_tier: structural
+    when:
+      github.fork: false
+      github.template.exists: false
+      attribution.explicit_fork_statement: false
+      candidates.count: ">=1"
+      similarity.path: "<=0.15"
+      tree.effective_files: ">=3"
+    result:
+      origin_type: ORIGINAL_WITH_DEPENDENCIES
+      confidence: 0.80
+      requires_review: true
       public_label: Original project
 
   - id: original

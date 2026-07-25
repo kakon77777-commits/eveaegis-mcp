@@ -23,6 +23,7 @@ never requires touching this file.
 
 from __future__ import annotations
 
+import re
 import sqlite3
 import uuid
 from collections import defaultdict
@@ -124,8 +125,8 @@ class Classifier:
             """
             INSERT INTO classifications
                 (id, repository_id, category, lifecycle, maturity, criticality,
-                 agent_access, confidence, signals, rationale, created_at)
-            VALUES (?,?,?,?,?,?,?,?,?,?,?)
+                 agent_access, confidence, signals, rationale, created_at, taxonomy_profile)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?)
             """,
             (
                 f"cls_{uuid.uuid4().hex[:16]}",
@@ -139,6 +140,7 @@ class Classifier:
                 dumps(result.signals),
                 dumps(result.rationale),
                 now,
+                result.taxonomy_profile,
             ),
         )
         if apply_to_repository:
@@ -194,6 +196,8 @@ class Classifier:
             confidence=float(row["confidence"]),
             signals=loads(row["signals"], {}) or {},
             rationale=loads(row["rationale"], []) or [],
+            taxonomy_profile=row["taxonomy_profile"],
+            classified_at=datetime.fromisoformat(row["created_at"]),
         )
 
     # -- §13.3 detectors --------------------------------------------------
@@ -352,10 +356,10 @@ class Classifier:
             "criticality": round(crit_conf, 3),
         }
         signals["origin_type"] = str(origin["origin_type"]) if origin else None
-        signals["taxonomy_profile"] = self.core.cfg.governance.taxonomy_profile
 
         return ClassificationResult(
             repository_id=sig.repository_id,
+            taxonomy_profile=self.core.cfg.governance.taxonomy_profile,
             category=category,
             lifecycle=lifecycle,
             maturity=maturity,
@@ -712,6 +716,38 @@ class Classifier:
 # --------------------------------------------------------------------------
 # module-level helpers
 # --------------------------------------------------------------------------
+
+#: ``owner/name`` or a GitHub URL, as written in a superseded notice.
+_REPO_REF = re.compile(r"(?:github\.com/)?([A-Za-z0-9._-]+/[A-Za-z0-9._-]+)")
+
+
+def _successor_from_text(
+    haystack: str,
+    marker: str,
+    known: Mapping[str, RepositorySignals],
+) -> str | None:
+    """Pull the successor repository out of the sentence containing ``marker``.
+
+    Only a name that exists in the same tenant is returned. A README can point
+    anywhere; a governance verdict should not invent a repository that the
+    inventory has never seen.
+    """
+    index = haystack.find(marker)
+    if index < 0:
+        return None
+    window = haystack[index : index + 240]
+    lowered = {name.lower(): name for name in known}
+    for match in _REPO_REF.finditer(window):
+        candidate = match.group(1).strip(".,;:)")
+        if candidate.lower() in lowered:
+            return lowered[candidate.lower()]
+        # Bare "name" references: resolve against the tail of a known full name.
+        tail = candidate.split("/")[-1].lower()
+        for lower_name, original in lowered.items():
+            if lower_name.split("/")[-1] == tail and tail:
+                return original
+    return None
+
 
 def _confidence(family_count: int, margin: float) -> float:
     """Honest confidence: independent agreement counts, repetition does not.

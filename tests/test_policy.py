@@ -352,7 +352,11 @@ class TestAxiom2Ceilings:
 
 class TestAxiom3Plans:
     def _setup(self, core: GovernanceCore) -> PolicyEngine:
-        repo = add_repo(core, "acme/site", agent_access=AgentAccess.PR_ONLY)
+        # HIGH criticality so an approval is genuinely required before apply, which
+        # is what separates "blocked now" from "needs a human eventually".
+        repo = add_repo(
+            core, "acme/site", agent_access=AgentAccess.PR_ONLY, criticality=Criticality.HIGH
+        )
         add_origin(core, repo, OriginType.ORIGINAL)
         add_principal(
             core,
@@ -597,6 +601,11 @@ class TestOriginBindings:
         )
         decision = engine.evaluate(request)
         assert "fork-policy" in decision.matched_policies
+        # The executor must see the requirements as data, not only as prose.
+        assert set(decision.constraints["requirements"]) >= {
+            "preserve_attribution",
+            "license_review",
+        }
         joined = " ".join(decision.reasons)
         assert "preserve_attribution" in joined and "license_review" in joined
 
@@ -811,4 +820,5 @@ class TestRiskScoring:
     def test_risk_reasons_are_always_present(self) -> None:
         cfg = load_policies("config/policies")
         level, reasons = assess_risk(make_request("get_portfolio_summary"), {}, {}, cfg)
-        a
+        assert level == RiskLevel.LOW
+        assert reasons

@@ -19,7 +19,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Iterable
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 MIGRATIONS: dict[int, str] = {
     1: """
@@ -288,6 +288,13 @@ MIGRATIONS: dict[int, str] = {
     BEGIN
         SELECT RAISE(ABORT, 'audit_events is append-only');
     END;
+    """,
+    2: """
+    -- Which taxonomy produced a verdict, and when. Previously only recoverable by
+    -- digging through the `signals` JSON blob, which made it unqueryable.
+    ALTER TABLE classifications ADD COLUMN taxonomy_profile TEXT NOT NULL DEFAULT 'evemisslab-v1';
+    CREATE INDEX IF NOT EXISTS idx_classifications_recent
+        ON classifications(repository_id, created_at DESC);
     """,
 }
 

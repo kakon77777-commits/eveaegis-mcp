@@ -99,7 +99,7 @@ class PolicyEngine:
 
     def evaluate(self, request: ActionRequest) -> PolicyDecision:
         """Decide one request and record the decision in the audit ledger (§18)."""
-        decision, trace = self._evaluate(request)
+        decision, _trace = self._evaluate(request)
         self.core.ledger.record(
             "policy_decision",
             actor=request.actor.id,
@@ -220,7 +220,7 @@ class PolicyEngine:
         for note in scope_notes:
             trace.note(note)
 
-        constraints = self._constraints(request, level, risk, ceiling, approval_policy)
+        constraints = self._constraints(request, level, risk, ceiling, approval_policy, trace)
         # An L0 read at LOW risk carries only informational constraints, so it is a
         # plain ALLOW; anything that writes, or that carries risk, is constrained.
         binding = approval_policy or writes or risk != RiskLevel.LOW
@@ -547,6 +547,7 @@ class PolicyEngine:
         risk: RiskLevel,
         ceiling: PermissionLevel,
         approval_required: bool,
+        trace: _Trace,
     ) -> dict[str, Any]:
         by_risk = self.policies.constraints.get("max_repositories_by_risk") or {}
         constraints: dict[str, Any] = {
@@ -572,27 +573,40 @@ class PolicyEngine:
             constraints["explicit_targets_required"] = True
         if request.dry_run:
             constraints["dry_run"] = True
+        if trace.requirements:
+            # §12 `require:` entries (preserve_attribution, license_review). The
+            # executor must be able to see these without parsing prose.
+            constraints["requirements"] = list(trace.requirements)
+            constraints["requirement_descriptions"] = {
+                name: self.policies.requirement_descriptions.get(name, "")
+                for name in trace.requirements
+            }
         return constraints
 
     # -- state loading ----------------------------------------------------
 
     def _principal(self, request: ActionRequest, trace: _Trace) -> Principal:
-        """Load the acting principal, or synthesise the most restrictive one."""
-        for candidate in (request.actor.id, request.actor.principal):
-            row = self.conn.execute(
-                "SELECT * FROM principals WHERE id = ?", (candidate,)
-            ).fetchone()
-            if row is not None:
-                roles = [Role(r) for r in (loads(row["roles"], []) or []) if r in Role.__members__]
-                return Principal(
-                    id=row["id"],
-                    tenant_id=row["tenant_id"],
-                    display_name=row["display_name"],
-                    actor_type=ActorType(row["actor_type"]),
-                    roles=roles,
-                    max_permission_level=PermissionLevel(row["max_permission_level"]),
-                    trust_level=row["trust_level"],
-                )
+        """Load the acting principal, or synthesise the most restrictive one.
+
+        Only ``actor.id`` is looked up. ``actor.principal`` says *on whose behalf*
+        the actor runs (§14) and must never be used as a fallback identity — an
+        unregistered agent naming a human principal would otherwise inherit that
+        human's ceiling, which is exactly the escalation axiom 2 forbids.
+        """
+        row = self.conn.execute(
+            "SELECT * FROM principals WHERE id = ?", (request.actor.id,)
+        ).fetchone()
+        if row is not None:
+            roles = [Role(r) for r in (loads(row["roles"], []) or []) if r in Role.__members__]
+            return Principal(
+                id=row["id"],
+                tenant_id=row["tenant_id"],
+                display_name=row["display_name"],
+                actor_type=ActorType(row["actor_type"]),
+                roles=roles,
+                max_permission_level=PermissionLevel(row["max_permission_level"]),
+                trust_level=row["trust_level"],
+            )
         trace.match(
             "unregistered-principal",
             f"principal '{request.actor.id}' is not registered; treated as "

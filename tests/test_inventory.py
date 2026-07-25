@@ -12,6 +12,7 @@ from typing import Any, Iterator
 import pytest
 
 from eveaegis.core import GovernanceCore
+from eveaegis.db import loads
 from eveaegis.inventory import (
     InventorySync,
     portfolio_summary,
@@ -72,6 +73,7 @@ class FakeGitHubClient:
         org_repos: dict[str, list[dict[str, Any]]] | None = None,
         languages: dict[str, dict[str, int]] | None = None,
         readmes: dict[str, str | None] | None = None,
+        trees: dict[str, list[dict[str, Any]]] | None = None,
         fail_on: dict[str, Exception] | None = None,
     ) -> None:
         self._viewer = viewer or {"id": 100, "login": "octo"}
@@ -80,6 +82,7 @@ class FakeGitHubClient:
         self._org_repos = org_repos or {}
         self._languages = languages or {}
         self._readmes = readmes or {}
+        self._trees = trees or {}
         self._fail_on = fail_on or {}
         self.request_count = 0
         self.closed = False
@@ -143,6 +146,11 @@ class FakeGitHubClient:
         self.request_count += 1
         self._boom(f"readme:{full_name}")
         return self._readmes.get(full_name)
+
+    def tree(self, full_name: str, ref: str, *, recursive: bool = True) -> list[dict[str, Any]]:
+        self.request_count += 1
+        self._boom(f"tree:{full_name}")
+        return self._trees.get(full_name, [])
 
 
 # --------------------------------------------------------------------------
@@ -222,7 +230,7 @@ def test_limit_and_optional_calls_are_respected(core: GovernanceCore) -> None:
         FakeGitHubClient(user_repos=[repo_payload(), repo_payload(repo_id=201, name="beta")]),
     )
     result = InventorySync(core).sync_repositories(
-        include_readme=False, include_languages=False, limit=1
+        include_readme=False, include_languages=False, include_tree=False, limit=1
     )
     assert result.repositories == 1
     # viewer + orgs + user_repos + nothing per repository
@@ -240,7 +248,7 @@ def test_archived_repo_seeds_archived_lifecycle_only(core: GovernanceCore) -> No
         ),
     )
     sync = InventorySync(core)
-    sync.sync_repositories(include_readme=False, include_languages=False)
+    sync.sync_repositories(include_readme=False, include_languages=False, include_tree=False)
 
     archived = sync.load_repository("octo/alpha")
     plain = sync.load_repository("octo/beta")
@@ -260,7 +268,7 @@ def test_archived_repo_seeds_archived_lifecycle_only(core: GovernanceCore) -> No
 def test_resync_never_overwrites_governance_overlay(core: GovernanceCore) -> None:
     client = bind(core, FakeGitHubClient(user_repos=[repo_payload()]))
     sync = InventorySync(core)
-    sync.sync_repositories(include_readme=False, include_languages=False)
+    sync.sync_repositories(include_readme=False, include_languages=False, include_tree=False)
 
     core.conn.execute(
         """
@@ -282,7 +290,7 @@ def test_resync_never_overwrites_governance_overlay(core: GovernanceCore) -> Non
 
     # Metadata genuinely changed upstream; the classification did not.
     client._user_repos = [repo_payload(description="renamed description", stargazers_count=99)]
-    sync.sync_repositories(include_readme=False, include_languages=False)
+    sync.sync_repositories(include_readme=False, include_languages=False, include_tree=False)
 
     asset = sync.load_repository("octo/alpha")
     assert asset is not None
@@ -301,11 +309,11 @@ def test_archiving_promotes_an_undecided_lifecycle(core: GovernanceCore) -> None
     """The narrow exception to write-once: UNKNOWN may become ARCHIVED."""
     client = bind(core, FakeGitHubClient(user_repos=[repo_payload()]))
     sync = InventorySync(core)
-    sync.sync_repositories(include_readme=False, include_languages=False)
+    sync.sync_repositories(include_readme=False, include_languages=False, include_tree=False)
     assert sync.load_repository("octo/alpha").lifecycle is Lifecycle.UNKNOWN  # type: ignore[union-attr]
 
     client._user_repos = [repo_payload(archived=True)]
-    sync.sync_repositories(include_readme=False, include_languages=False)
+    sync.sync_repositories(include_readme=False, include_languages=False, include_tree=False)
 
     asset = sync.load_repository("octo/alpha")
     assert asset is not None
@@ -317,7 +325,7 @@ def test_archiving_never_overwrites_a_decided_lifecycle(core: GovernanceCore) ->
     """The exception only ever promotes from UNKNOWN — a real verdict is untouchable."""
     client = bind(core, FakeGitHubClient(user_repos=[repo_payload()]))
     sync = InventorySync(core)
-    sync.sync_repositories(include_readme=False, include_languages=False)
+    sync.sync_repositories(include_readme=False, include_languages=False, include_tree=False)
 
     core.conn.execute(
         "UPDATE repositories SET lifecycle = ? WHERE full_name = ?",
@@ -326,7 +334,7 @@ def test_archiving_never_overwrites_a_decided_lifecycle(core: GovernanceCore) ->
     core.conn.commit()
 
     client._user_repos = [repo_payload(archived=True)]
-    sync.sync_repositories(include_readme=False, include_languages=False)
+    sync.sync_repositories(include_readme=False, include_languages=False, include_tree=False)
 
     asset = sync.load_repository("octo/alpha")
     assert asset is not None
@@ -341,7 +349,7 @@ def test_omitted_optional_data_is_preserved_not_cleared(core: GovernanceCore) ->
     )
     sync = InventorySync(core)
     sync.sync_repositories(include_readme=False)
-    sync.sync_repositories(include_readme=False, include_languages=False)
+    sync.sync_repositories(include_readme=False, include_languages=False, include_tree=False)
 
     asset = sync.load_repository("octo/alpha")
     assert asset is not None
@@ -387,9 +395,51 @@ def test_snapshots_dedupe_by_content_hash(core: GovernanceCore) -> None:
 
 def test_missing_readme_writes_no_snapshot(core: GovernanceCore) -> None:
     bind(core, FakeGitHubClient(user_repos=[repo_payload()], readmes={}))
-    result = InventorySync(core).sync_repositories(include_languages=False)
+    result = InventorySync(core).sync_repositories(include_languages=False, include_tree=False)
     assert result.errors == []
     assert "readme" not in _snapshot_counts(core)
+
+
+def test_tree_snapshot_is_stored_for_offline_path_evidence(core: GovernanceCore) -> None:
+    """Phases 2/3 read paths from here; without it, file markers see nothing."""
+    entries = [
+        {"path": "pyproject.toml", "type": "blob", "size": 400},
+        {"path": "src", "type": "tree", "size": 0},
+        {"path": "src/app.py", "type": "blob", "size": 1200},
+    ]
+    bind(core, FakeGitHubClient(user_repos=[repo_payload()], trees={"octo/alpha": entries}))
+    InventorySync(core).sync_repositories(include_readme=False, include_languages=False)
+
+    row = core.conn.execute(
+        "SELECT payload FROM repository_snapshots WHERE kind = 'tree'"
+    ).fetchone()
+    assert row is not None
+    payload = loads(row["payload"])
+    assert payload["ref"] == "main"
+    assert payload["truncated"] is False
+    assert [e["path"] for e in payload["tree"]] == [e["path"] for e in entries]
+
+
+def test_tree_snapshot_is_capped_and_flagged(core: GovernanceCore) -> None:
+    """A vendored monster tree must not blow up the snapshot table silently."""
+    entries = [{"path": f"f{i}.txt", "type": "blob", "size": 1} for i in range(6000)]
+    bind(core, FakeGitHubClient(user_repos=[repo_payload()], trees={"octo/alpha": entries}))
+    InventorySync(core).sync_repositories(include_readme=False, include_languages=False)
+
+    payload = loads(
+        core.conn.execute(
+            "SELECT payload FROM repository_snapshots WHERE kind = 'tree'"
+        ).fetchone()["payload"]
+    )
+    assert payload["truncated"] is True
+    assert len(payload["tree"]) == InventorySync.MAX_TREE_ENTRIES
+
+
+def test_empty_repository_tree_is_not_an_error(core: GovernanceCore) -> None:
+    bind(core, FakeGitHubClient(user_repos=[repo_payload()], trees={}))
+    result = InventorySync(core).sync_repositories(include_readme=False, include_languages=False)
+    assert result.errors == []
+    assert "tree" not in _snapshot_counts(core)
 
 
 # --------------------------------------------------------------------------
@@ -436,7 +486,7 @@ def test_failed_org_listing_still_yields_personal_repos(core: GovernanceCore) ->
             fail_on={"org_repos:evemisslab": RuntimeError("403 not a member")},
         ),
     )
-    result = InventorySync(core).sync_repositories(include_readme=False, include_languages=False)
+    result = InventorySync(core).sync_repositories(include_readme=False, include_languages=False, include_tree=False)
     assert result.accounts == 2
     assert result.repositories == 1
     assert len(result.errors) == 1
@@ -444,7 +494,7 @@ def test_failed_org_listing_still_yields_personal_repos(core: GovernanceCore) ->
 
 def test_audit_events_carry_credential_facts_and_counts(core: GovernanceCore) -> None:
     bind(core, FakeGitHubClient(user_repos=[repo_payload()]))
-    InventorySync(core).sync_repositories(include_readme=False, include_languages=False)
+    InventorySync(core).sync_repositories(include_readme=False, include_languages=False, include_tree=False)
 
     row = core.conn.execute(
         "SELECT * FROM audit_events WHERE action = 'inventory_sync_completed'"
@@ -463,11 +513,11 @@ def test_audit_events_carry_credential_facts_and_counts(core: GovernanceCore) ->
 def test_rename_keeps_id_and_snapshot_history(core: GovernanceCore) -> None:
     client = bind(core, FakeGitHubClient(user_repos=[repo_payload()], readmes={"octo/alpha": "x"}))
     sync = InventorySync(core)
-    sync.sync_repositories(include_languages=False)
+    sync.sync_repositories(include_languages=False, include_tree=False)
 
     client._user_repos = [repo_payload(name="alpha-renamed")]
     client._readmes = {"octo/alpha-renamed": "x"}
-    result = sync.sync_repositories(include_languages=False)
+    result = sync.sync_repositories(include_languages=False, include_tree=False)
 
     assert result.errors == []
     assert core.conn.execute("SELECT COUNT(*) FROM repositories").fetchone()[0] == 1
@@ -480,10 +530,10 @@ def test_rename_keeps_id_and_snapshot_history(core: GovernanceCore) -> None:
 def test_recreated_repository_is_reported_not_silently_repointed(core: GovernanceCore) -> None:
     client = bind(core, FakeGitHubClient(user_repos=[repo_payload()]))
     sync = InventorySync(core)
-    sync.sync_repositories(include_readme=False, include_languages=False)
+    sync.sync_repositories(include_readme=False, include_languages=False, include_tree=False)
 
     client._user_repos = [repo_payload(repo_id=999)]  # same name, new GitHub id
-    result = sync.sync_repositories(include_readme=False, include_languages=False)
+    result = sync.sync_repositories(include_readme=False, include_languages=False, include_tree=False)
 
     assert result.repositories == 0
     assert len(result.errors) == 1
@@ -504,7 +554,7 @@ def test_fork_resolves_parent_and_source(core: GovernanceCore) -> None:
     )
     bind(core, FakeGitHubClient(user_repos=[fork]))
     sync = InventorySync(core)
-    sync.sync_repositories(include_readme=False, include_languages=False)
+    sync.sync_repositories(include_readme=False, include_languages=False, include_tree=False)
 
     asset = sync.load_repository("octo/tandem-browser")
     assert asset is not None
@@ -530,7 +580,7 @@ def test_fork_without_parent_in_list_payload_pays_for_the_detail_call(
     client.repo = fake_repo  # type: ignore[method-assign]
 
     sync = InventorySync(core)
-    sync.sync_repositories(include_readme=False, include_languages=False)
+    sync.sync_repositories(include_readme=False, include_languages=False, include_tree=False)
 
     fork_asset = sync.load_repository("octo/tandem-browser")
     plain_asset = sync.load_repository("octo/alpha")

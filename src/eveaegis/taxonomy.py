@@ -7,6 +7,13 @@ can rely on the label space being stable.
 Design rule inherited from the whitepaper: every vocabulary carries an explicit
 ``UNKNOWN`` member. Absence of evidence is a first-class state, never silently
 coerced into a confident label (axiom 4).
+
+One exception, and it is the whitepaper's, not ours: §5.4 defines
+:class:`Criticality` with four members and no ``UNKNOWN``, so "we have no evidence"
+and "genuinely low stakes" both surface as ``LOW``. The classifier compensates by
+reporting a low confidence and saying so in its rationale, but the label itself is
+lossy. Adding ``Criticality.UNKNOWN`` would fix that at the cost of diverging from
+the spec — a decision for the spec's author, not for this module.
 """
 
 from __future__ import annotations

@@ -222,6 +222,8 @@ class ClassificationResult(Base):
     """§5 — what the classifier concluded, and why."""
 
     repository_id: str
+    taxonomy_profile: str = "evemisslab-v1"
+    classified_at: datetime = Field(default_factory=utcnow)
     category: Category = Category.UNKNOWN
     lifecycle: Lifecycle = Lifecycle.UNKNOWN
     maturity: Maturity = Maturity.UNKNOWN
