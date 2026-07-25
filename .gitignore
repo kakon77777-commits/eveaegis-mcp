@@ -1,0 +1,29 @@
+# --- EveAegis local state (never commit) ---
+workspace/
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
+config/config.yaml
+config/*.local.yaml
+*.pem
+*.key
+.secrets/
+
+# --- Python ---
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.venv/
+venv/
+dist/
+build/
+.mypy_cache/
+.ruff_cache/
+
+# --- OS / editors ---
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/

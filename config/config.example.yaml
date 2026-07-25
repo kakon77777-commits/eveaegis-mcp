@@ -1,0 +1,59 @@
+# EveAegis configuration.
+# Copy to config/config.yaml and edit. This file must never contain secrets —
+# credentials are resolved at call time by the credential broker (axiom 1).
+
+database_path: workspace/eveaegis.db
+
+credentials:
+  # gh_cli     — delegate to the GitHub CLI keyring. Zero setup, read/metadata only.
+  # github_app — short-lived installation tokens. Requires a registered GitHub App.
+  backend: gh_cli
+
+  # Only used when backend = github_app.
+  app_id: null
+  private_key_path: null
+  installation_id: null
+
+  # Hard ceiling on the life of any minted grant (axiom 5).
+  max_token_lifetime_seconds: 600
+
+github:
+  api_base: https://api.github.com
+  per_page: 100
+  timeout_seconds: 30.0
+  max_retries: 3
+  min_remaining_before_pause: 50
+
+analysis:
+  workspace_dir: workspace
+  # §21 — never run code out of a cloned repository.
+  allow_repository_code_execution: false
+  clone_depth: null
+  max_blob_bytes: 1048576
+  minhash_permutations: 128
+  shingle_size: 5
+  excluded_dirs:
+    - node_modules
+    - .venv
+    - venv
+    - vendor
+    - third_party
+    - dist
+    - build
+    - generated
+    - coverage
+    - .cache
+    - .git
+    - __pycache__
+    - target
+    - site-packages
+
+governance:
+  tenant_id: evemisslab
+  tenant_name: EveMissLab
+  tenant_type: laboratory
+  policy_dir: config/policies
+  taxonomy_profile: evemisslab-v1
+  # Phase 0 default. Flip to false only once the write path has been reviewed.
+  read_only: true
+  require_human_approval: true

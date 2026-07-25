@@ -1,0 +1,41 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "eveaegis"
+version = "0.1.0"
+description = "EveAegis — AI-native GitHub portfolio governance control plane, exposed over MCP"
+readme = "README.md"
+requires-python = ">=3.11"
+license = { file = "LICENSE" }
+authors = [{ name = "Neo.K", email = "kakon77777@gmail.com" }]
+keywords = ["mcp", "github", "governance", "provenance", "agent-safety"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "Programming Language :: Python :: 3.11",
+    "Topic :: Software Development :: Version Control :: Git",
+]
+
+dependencies = [
+    "pydantic>=2.7",
+    "httpx>=0.27",
+    "PyYAML>=6.0",
+    "typer>=0.12",
+    "rich>=13.0",
+]
+
+[project.optional-dependencies]
+mcp = ["mcp>=1.2"]
+dev = ["pytest>=8.0", "pytest-asyncio>=0.23"]
+
+[project.scripts]
+aegis = "eveaegis.cli:app"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/eveaegis"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
