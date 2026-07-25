@@ -88,6 +88,27 @@ src/eveaegis/
 
 ---
 
+## 對真實 portfolio 的實跑結果
+
+v0.1 對 `kakon77777-commits` 的 **55 個倉庫**做過完整唯讀實跑（sync → origin → classify），167 筆稽核事件、雜湊鏈驗證通過：
+
+| | |
+|---|---|
+| 倉庫 / 快照 | 55 / 216 |
+| 正式 Fork | 16 — 全部 `READ_ONLY` + `NEEDS_REVIEW` + 零原創宣稱 |
+| `ORIGINAL_WITH_DEPENDENCIES` | 28（信心 0.88） |
+| `DERIVATIVE_PROJECT` / `PLUGIN_OR_EXTENSION` | 1 / 2 |
+| 來源無法判定 | 1 — 降級為 `READ_ONLY` |
+| 授權狀態 | CLEAR 8、NOTICE_REQUIRED 5、ATTRIBUTION_REQUIRED 3、REVIEW_REQUIRED 8、UNKNOWN 31 |
+
+值得注意的是**引擎自己抓到的三個錯誤**，因為它們都是同一條邊界的實例：
+
+- 某專案因 `package.json` 的 devDependencies 有 `vite-plugin-svgr`，被判成「外掛專案」— 把**依賴當成專案自身性質**
+- 某專案因 NOTICE 致謝了靈感來源，被判成來源不明 — **致謝不等於血緣**
+- 兩個專案因為有 `ai/governance/license.md`（自己寫的 AI 權利宣告頁）被送去法務審查 — **談論授權的文件不是被嵌入的第三方授權**
+
+三個都已修正並有回歸測試。第三個修正後保留了 `documentary_license_files` 欄位：被排除的東西仍然看得見，讓覆核的人看到的是判斷，而不只是判斷的結果。
+
 ## 第一版明確不做
 
 自動合併程式碼 PR、自動刪除倉庫、自動改 License、自動改 Visibility、自動搬移 Organization、自動操作 Secrets、執行倉庫任意程式、對外宣稱百分之百原創、跨全網程式碼抄襲判定、任何法律結論。
@@ -96,6 +117,34 @@ src/eveaegis/
 
 ---
 
+## 用法
+
+```bash
+aegis doctor                      # 檢查設定、憑證、資料庫、稽核鏈
+aegis sync                        # Phase 1：同步資產目錄
+aegis origin --all                # Phase 2：來源判定（--deep 加做 commit/blob 比對）
+aegis classify --all --apply      # Phase 3：分類
+aegis matrix                      # §19.2 Repository Matrix
+aegis review list                 # 待人工覆核的來源判定
+aegis review set <repo> confirm   # 確認判定（僅限人類，agent 無此工具）
+aegis policy <tool> --explain     # 問政策引擎「如果做這件事會怎樣」
+aegis audit verify                # 驗證雜湊鏈
+aegis serve                       # 以 MCP stdio 提供給本地 agent
+```
+
+接到 Claude Code 等 MCP 客戶端的方式見 [docs/MCP.md](docs/MCP.md)。
+
+## 目前進度
+
+Phase 0–3 完成（安全骨架、Inventory、Origin & Provenance、Classification + Policy）。
+
+Phase 4（Metadata Governance）與 Phase 5（Safe Documentation PR）尚未實作 —
+它們需要寫入權限，而寫入權限需要先把憑證後端換成 GitHub App。在那之前
+`governance.read_only` 維持 `true`，所有寫入工具**不存在於工具清單**，而不是存在但會拒絕。
+
 ## 授權
 
 MIT © 2026 EVEMISS TECHNOLOGY CO., LTD.（一言諾科技有限公司）／Neo.K（許筌崴）
+
+實作自技術白皮書《AI 原生 GitHub 多倉庫治理 MCP v0.1》。與白皮書的唯一刻意差異：
+§5.4 的 `Criticality` 增加了 `UNKNOWN` 成員，理由見 `src/eveaegis/taxonomy.py` 模組註解。
