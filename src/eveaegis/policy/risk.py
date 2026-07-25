@@ -18,6 +18,7 @@ from typing import Any, Iterable, Mapping, Sequence
 from ..models import ActionRequest, OriginProfile, RepositoryAsset
 from ..taxonomy import (
     RISK_RANK,
+    CRITICALITY_RISK_RANK,
     Criticality,
     LicenseStatus,
     OriginType,
@@ -184,12 +185,13 @@ def escalate(current: RiskLevel, floor: RiskLevel) -> RiskLevel:
 
 
 def _crit_rank(value: Criticality) -> int:
-    return {
-        Criticality.LOW: 0,
-        Criticality.MEDIUM: 1,
-        Criticality.HIGH: 2,
-        Criticality.CRITICAL: 3,
-    }[value]
+    """Risk ordering, where UNKNOWN outranks MEDIUM.
+
+    Deliberately *not* the classifier's evidence ordering: an ungraded repository
+    is unexamined, not safe. Ranking UNKNOWN at the bottom here would make "nobody
+    ever classified it" the cheapest thing in the portfolio to write to.
+    """
+    return CRITICALITY_RISK_RANK[value]
 
 
 def _index(items: Any, key: Any) -> Mapping[str, Any]:

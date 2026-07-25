@@ -39,6 +39,7 @@ from ..db import dumps, loads
 from ..models import ClassificationResult
 from ..taxonomy import (
     AGENT_ACCESS_RANK,
+    CRITICALITY_EVIDENCE_RANK,
     AgentAccess,
     Category,
     Criticality,
@@ -48,14 +49,10 @@ from ..taxonomy import (
 )
 from .signals import RepositorySignals, collect_signals, load_repository_row
 
-#: Criticality ordering — the enum has no UNKNOWN member, so LOW is the
-#: least-privilege default and every step above it must be justified.
-_CRITICALITY_RANK: dict[Criticality, int] = {
-    Criticality.LOW: 0,
-    Criticality.MEDIUM: 1,
-    Criticality.HIGH: 2,
-    Criticality.CRITICAL: 3,
-}
+#: Classification escalates along the *evidence* ordering: UNKNOWN is the floor and
+#: every step above it must be justified by an observation. The risk engine uses a
+#: different ordering on purpose — see :data:`eveaegis.taxonomy.CRITICALITY_RISK_RANK`.
+_CRITICALITY_RANK = CRITICALITY_EVIDENCE_RANK
 
 
 class TaxonomyProfile:
@@ -585,9 +582,11 @@ class Classifier:
         rationale: list[str],
     ) -> tuple[Criticality, float]:
         hints = self.profile.section("criticality_hints", {}) or {}
-        verdict = Criticality.LOW
+        # Start from UNKNOWN, not LOW: "we found no signal" is a different claim from
+        # "this is genuinely low stakes", and the risk engine treats them differently.
+        verdict = Criticality.UNKNOWN
         notes: list[str] = []
-        confidence = 0.30  # LOW-by-default is a policy choice, not an observation
+        confidence = 0.20
 
         def raise_to(level: Criticality, note: str, conf: float) -> None:
             nonlocal verdict, confidence
@@ -628,15 +627,18 @@ class Classifier:
                 )
 
         if lifecycle in (Lifecycle.ARCHIVED, Lifecycle.SUPERSEDED) and verdict != Criticality.LOW:
-            # A retired asset cannot be load-bearing, whatever its name suggests.
-            notes.append(f"downgraded from {verdict} because lifecycle is {lifecycle}")
+            # A retired asset cannot be load-bearing, whatever its name suggests. This
+            # is a genuine observation, so it resolves UNKNOWN to LOW rather than
+            # leaving it ungraded.
+            notes.append(f"resolved to LOW from {verdict} because lifecycle is {lifecycle}")
             verdict, confidence = Criticality.LOW, 0.60
 
         if notes:
             rationale.append(f"criticality={verdict}: " + "; ".join(notes[:4]))
         else:
             rationale.append(
-                "criticality=LOW: no criticality signal found; LOW is the least-privilege default"
+                "criticality=UNKNOWN: no criticality signal found; not graded, which the "
+                "risk engine treats as more dangerous than a graded LOW, not less"
             )
         return verdict, confidence
 

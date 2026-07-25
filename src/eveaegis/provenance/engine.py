@@ -73,8 +73,11 @@ from .contribution import estimate_contribution
 from .fingerprint import (
     blob_similarity,
     commit_similarity,
+    fingerprint_overlap,
     normalized_text_hash,
     overlap_coefficient,
+    token_similarity,
+    winnow_fingerprints,
 )
 from .rules import OriginRule, RuleEvaluation, evaluate_rules, load_rules
 
@@ -171,6 +174,10 @@ _MANIFEST_FILES: tuple[str, ...] = (
 
 #: GitHub's tree endpoint caps out here; beyond it the tree is silently partial.
 _TREE_ENTRY_LIMIT = 100_000
+
+#: How many changed files deep mode fingerprints. Smallest first — token similarity
+#: on a 5 MB generated file measures the generator, not the author.
+_TOKEN_SAMPLE_LIMIT = 25
 
 #: Public labels by origin type (§23.2). Conservative wording throughout.
 _PUBLIC_LABELS: dict[OriginType, str] = {
@@ -304,6 +311,7 @@ class ProvenanceEngine:
                 "origin_type": str(profile.origin_type),
                 "confidence": profile.origin_confidence,
                 "matched_rule": profile.matched_rule,
+                "analysis_depth": profile.analysis_depth,
                 "review_status": str(profile.review_status),
                 "depth": "deep" if deep else "shallow",
                 "evidence_count": len(profile.evidence),
@@ -437,13 +445,20 @@ class ProvenanceEngine:
             SELECT o.*, r.full_name
             FROM origin_profiles o
             LEFT JOIN repositories r ON r.id = o.repository_id
-            WHERE o.review_status IN ('UNREVIEWED', 'NEEDS_REVIEW', 'LEGAL_REVIEW_REQUESTED')
+            WHERE o.review_status IN ('NEEDS_REVIEW', 'LEGAL_REVIEW_REQUESTED')
+               OR (o.review_status = 'UNREVIEWED' AND o.public_originality_claim != 'none')
             ORDER BY o.origin_confidence ASC, o.updated_at DESC
             """
         ).fetchall()
         queue: list[dict[str, Any]] = []
         for row in rows:
             reasons: list[str] = []
+            if row["review_status"] == str(ReviewStatus.UNREVIEWED):
+                # Not a problem, but still an unexamined public assertion.
+                reasons.append(
+                    f"public originality claim '{row['public_originality_claim']}' "
+                    f"has not been confirmed by a human"
+                )
             if row["origin_type"] == str(OriginType.UNKNOWN):
                 reasons.append("origin could not be determined")
             if row["origin_confidence"] < ORIGINALITY_CLAIM_THRESHOLD:
@@ -828,7 +843,7 @@ class ProvenanceEngine:
         if len(candidate_paths) < _MIN_PATHS_FOR_OVERLAP:
             return
         overlap = overlap_coefficient(own_paths, candidate_paths)
-        best.similarity.text = round(overlap, 4)
+        best.similarity.path = round(overlap, 4)
         bundle.add(
             EvidenceKind.FILE_EVIDENCE,
             "similarity.path_overlap",
@@ -947,7 +962,9 @@ class ProvenanceEngine:
                         supports=[OriginType.DETACHED_FORK, OriginType.GITHUB_FORK],
                     )
                 upstream_blobs = gitlocal.blob_entries(clone, upstream_ref)
-                self._blob_evidence(bundle, best, own_blobs, upstream_blobs)
+                self._blob_evidence(
+                    bundle, best, own_blobs, upstream_blobs, clone=clone, head=head, upstream_ref=upstream_ref
+                )
 
         if bundle.measurement != "blob_exact":
             # Blob comparison did not run (no comparable upstream ref). Commit overlap
@@ -968,6 +985,10 @@ class ProvenanceEngine:
         candidate: UpstreamCandidate,
         own_blobs: Sequence[gitlocal.BlobEntry],
         upstream_blobs: Sequence[gitlocal.BlobEntry],
+        *,
+        clone: gitlocal.MirrorClone,
+        head: str,
+        upstream_ref: str,
     ) -> None:
         """§7.1 S_blob over *effective* content only — §9.1 applied to blobs too."""
         classified = {file.path: file.component_class for file in bundle.summary.files}
@@ -1011,6 +1032,72 @@ class ProvenanceEngine:
             retained_by_bytes=round(retained_bytes, 4),
             modified_shared_path_files=len(modified),
         )
+        if modified:
+            self._token_evidence(bundle, candidate, modified, clone, head, upstream_ref)
+
+    def _token_evidence(
+        self,
+        bundle: RepositoryEvidenceBundle,
+        candidate: UpstreamCandidate,
+        modified: Sequence[gitlocal.BlobEntry],
+        clone: gitlocal.MirrorClone,
+        head: str,
+        upstream_ref: str,
+    ) -> None:
+        """§7.1 S_token and winnowing over the files that changed but kept their path.
+
+        Only the *modified* population is measured. Byte-identical files are already
+        settled by S_blob, and running fingerprints over them would inflate token
+        similarity to near 1.0 for any fork — a number that says nothing.
+
+        Both readings are recorded, and neither may move the verdict on its own:
+        §7.2 puts token similarity below blob history and commit ancestry.
+        """
+        sample = sorted(modified, key=lambda b: b.size)[:_TOKEN_SAMPLE_LIMIT]
+        token_scores: list[float] = []
+        winnow_scores: list[float] = []
+        for blob in sample:
+            own_text = gitlocal.read_blob(clone, head, blob.path, max_bytes=self.cfg.max_blob_bytes)
+            upstream_text = gitlocal.read_blob(
+                clone, upstream_ref, blob.path, max_bytes=self.cfg.max_blob_bytes
+            )
+            if not own_text or not upstream_text:
+                continue
+            token_scores.append(
+                token_similarity(
+                    own_text,
+                    upstream_text,
+                    permutations=self.cfg.minhash_permutations,
+                    shingle_size=self.cfg.shingle_size,
+                )
+            )
+            winnow_scores.append(
+                fingerprint_overlap(
+                    winnow_fingerprints(own_text, k=self.cfg.shingle_size),
+                    winnow_fingerprints(upstream_text, k=self.cfg.shingle_size),
+                )
+            )
+        if not token_scores:
+            return
+        mean_token = sum(token_scores) / len(token_scores)
+        mean_winnow = sum(winnow_scores) / len(winnow_scores) if winnow_scores else None
+        candidate.similarity.token = round(mean_token, 4)
+        bundle.add(
+            EvidenceKind.CODE_EVIDENCE,
+            "similarity.token",
+            f"{mean_token:.3f} mean over {len(token_scores)} modified file(s) shared with "
+            f"{candidate.full_name}",
+            weight=0.5,
+            method="minhash_over_token_shingles",
+            winnow_overlap=round(mean_winnow, 4) if mean_winnow is not None else None,
+            sampled_files=[b.path for b in sample][:10],
+            note="weaker than blob and commit evidence; cannot override them (§7.2)",
+        )
+        # §8.2 轉化深度 = (share of retained files that changed) × (how deeply they
+        # changed). Either factor alone overstates: touching every file trivially is
+        # not a transformation, and rewriting one file out of a thousand is not either.
+        if bundle.upstream_modified_ratio is not None:
+            bundle.upstream_modified_ratio *= 1.0 - mean_token
 
     # -- §22 step 11-14: facts, verdict, labels ----------------------------
 
@@ -1063,11 +1150,10 @@ class ProvenanceEngine:
         facts["attribution.upstream_count"] = len(
             {e.value.split(" — ")[0] for e in attribution}
         )
+        # Only a statement that names a repository counts. "Based on the ideas in X"
+        # with no repository reference is prose, not an ancestry declaration.
         facts["attribution.explicit_fork_statement"] = any(
             _FORK_STATEMENT_RE.search(e.value) for e in attribution
-        ) or bool(
-            bundle.readme and _FORK_STATEMENT_RE.search(bundle.readme.split("\n\n")[0] if bundle.readme else "")
-            and upstream
         )
 
         facts["template_signature.detected"] = facts["github.template.exists"]
@@ -1083,16 +1169,16 @@ class ProvenanceEngine:
                 facts["similarity.commit"] = best.similarity.commit
             if best.similarity.blob is not None:
                 facts["similarity.blob"] = best.similarity.blob
-            if best.similarity.text is not None:
-                facts["similarity.path"] = best.similarity.text
+            if best.similarity.path is not None:
+                facts["similarity.path"] = best.similarity.path
             if best.similarity.token is not None:
                 facts["similarity.token"] = best.similarity.token
             if bundle.deep:
                 facts["common_root_commit"] = bool(best.shared_root_commit)
-        if "local_unique_commits" in bundle.license_detail:
-            facts["local_unique_commits"] = bundle.license_detail["local_unique_commits"]
-        if "sync_pattern" in bundle.license_detail:
-            facts["sync_pattern.detected"] = bundle.license_detail["sync_pattern"]
+        if "local_unique_commits" in bundle.git_facts:
+            facts["local_unique_commits"] = bundle.git_facts["local_unique_commits"]
+        if "sync_pattern" in bundle.git_facts:
+            facts["sync_pattern.detected"] = bundle.git_facts["sync_pattern"]
         if bundle.upstream_retained_files is not None:
             facts["upstream_retained"] = round(bundle.upstream_retained_files, 4)
             facts["local_contribution"] = round(1.0 - bundle.upstream_retained_files, 4)
@@ -1146,6 +1232,7 @@ class ProvenanceEngine:
             origin_type=origin_type,
             origin_confidence=round(confidence, 4),
             matched_rule=evaluation.matched_rule_id,
+            analysis_depth="deep" if bundle.deep else "shallow",
             evidence=bundle.evidence,
             upstream_candidates=bundle.candidates,
             components=components,
@@ -1329,6 +1416,7 @@ class ProvenanceEngine:
             origin_type=OriginType(row["origin_type"]),
             origin_confidence=row["origin_confidence"],
             matched_rule=row["matched_rule"],
+            analysis_depth=row["analysis_depth"],
             evidence=[Evidence(**e) for e in loads(row["evidence"], [])],
             upstream_candidates=candidates,
             components=components,
@@ -1472,31 +1560,49 @@ def _manifest_repository_urls(name: str, text: str) -> list[str]:
 
 
 def _plugin_signature(bundle: RepositoryEvidenceBundle) -> bool:
-    """Does the repository declare itself an extension of a host platform?
+    """Does the repository declare *itself* an extension of a host platform?
 
-    §9.1 in miniature: writing a plugin *for* something is a dependency relationship,
-    never descent from it, so this signal must not create an upstream candidate.
+    Only structured self-description counts — the package's own name, keywords and
+    host-declaration blocks. Scanning the raw manifest text would match a build-time
+    dependency such as ``vite-plugin-svgr`` and label an ordinary web application a
+    plugin, which is §9.1's error in miniature: depending on something is not being
+    an extension of it, just as it is not descending from it.
     """
-    manifest = bundle.manifests.get("manifest.json")
-    if manifest:
-        try:
-            data = json.loads(manifest)
-            if isinstance(data, dict) and ("manifest_version" in data or "minAppVersion" in data):
-                return True
-        except (json.JSONDecodeError, ValueError):
-            pass
-    package = bundle.manifests.get("package.json")
+    manifest = _json_manifest(bundle, "manifest.json")
+    if manifest and ("manifest_version" in manifest or "minAppVersion" in manifest):
+        return True  # browser extension (MV2/MV3) or Obsidian plugin
+
+    package = _json_manifest(bundle, "package.json")
     if package:
-        lowered = package.lower()
-        if '"contributes"' in lowered or '"vscode"' in lowered:
+        if "contributes" in package or "vscode" in (package.get("engines") or {}):
             return True
-        if any(hint in lowered for hint in _PLUGIN_HINTS):
+        own_name = str(package.get("name", "")).lower()
+        keywords = {str(k).lower() for k in (package.get("keywords") or [])}
+        if any(hint in own_name for hint in _PLUGIN_HINTS):
             return True
-    pyproject = bundle.manifests.get("pyproject.toml", "")
-    if "entry-points" in pyproject.lower() and any(h in pyproject.lower() for h in _PLUGIN_HINTS):
+        if keywords & {"plugin", "extension", "addon", "add-on"}:
+            return True
+
+    pyproject = bundle.manifests.get("pyproject.toml", "").lower()
+    if "[project.entry-points" in pyproject and any(hint in pyproject for hint in _PLUGIN_HINTS):
         return True
+
     topics = {str(t).lower() for t in (bundle.metadata.get("topics") or [])}
-    return bool(topics & {"plugin", "extension", "chrome-extension", "vscode-extension", "obsidian-plugin", "addon"})
+    return bool(
+        topics
+        & {"plugin", "extension", "chrome-extension", "vscode-extension", "obsidian-plugin", "addon"}
+    )
+
+
+def _json_manifest(bundle: RepositoryEvidenceBundle, name: str) -> dict[str, Any] | None:
+    text = bundle.manifests.get(name)
+    if not text:
+        return None
+    try:
+        data = json.loads(text)
+    except (json.JSONDecodeError, ValueError):
+        return None
+    return data if isinstance(data, dict) else None
 
 
 def _scaffold_signature(bundle: RepositoryEvidenceBundle) -> bool:

@@ -113,7 +113,7 @@ class RepositoryAsset(Base):
     lifecycle: Lifecycle = Lifecycle.UNKNOWN
     category: Category = Category.UNKNOWN
     maturity: Maturity = Maturity.UNKNOWN
-    criticality: Criticality = Criticality.LOW
+    criticality: Criticality = Criticality.UNKNOWN
     agent_access: AgentAccess = AgentAccess.READ_ONLY
     origin_profile_id: str | None = None
     policy_profile: str = "default"
@@ -145,6 +145,10 @@ class SimilarityVector(Base):
 
     commit: float | None = None
     blob: float | None = None
+    #: Directory-structure overlap. Kept distinct from ``text`` because "the same
+    #: files exist" and "the same bytes are inside them" are different claims, and
+    #: §7.2 ranks them differently.
+    path: float | None = None
     text: float | None = None
     token: float | None = None
     ast: float | None = None
@@ -206,6 +210,11 @@ class OriginProfile(Base):
     origin_type: OriginType = OriginType.UNKNOWN
     origin_confidence: float = 0.0
     matched_rule: str | None = None
+    #: How hard the engine actually looked: ``shallow`` is metadata + tree + docs,
+    #: ``deep`` additionally compared commit graphs and blobs from a bare mirror.
+    #: Stored because the two carry very different weight and were otherwise
+    #: indistinguishable once persisted.
+    analysis_depth: str = "shallow"
     evidence: list[Evidence] = Field(default_factory=list)
     upstream_candidates: list[UpstreamCandidate] = Field(default_factory=list)
     components: list[ComponentProfile] = Field(default_factory=list)
@@ -227,7 +236,7 @@ class ClassificationResult(Base):
     category: Category = Category.UNKNOWN
     lifecycle: Lifecycle = Lifecycle.UNKNOWN
     maturity: Maturity = Maturity.UNKNOWN
-    criticality: Criticality = Criticality.LOW
+    criticality: Criticality = Criticality.UNKNOWN
     agent_access: AgentAccess = AgentAccess.READ_ONLY
     confidence: float = 0.0
     signals: dict[str, Any] = Field(default_factory=dict)

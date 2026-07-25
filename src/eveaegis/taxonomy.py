@@ -8,12 +8,11 @@ Design rule inherited from the whitepaper: every vocabulary carries an explicit
 ``UNKNOWN`` member. Absence of evidence is a first-class state, never silently
 coerced into a confident label (axiom 4).
 
-One exception, and it is the whitepaper's, not ours: §5.4 defines
-:class:`Criticality` with four members and no ``UNKNOWN``, so "we have no evidence"
-and "genuinely low stakes" both surface as ``LOW``. The classifier compensates by
-reporting a low confidence and saying so in its rationale, but the label itself is
-lossy. Adding ``Criticality.UNKNOWN`` would fix that at the cost of diverging from
-the spec — a decision for the spec's author, not for this module.
+One deliberate deviation from the whitepaper: §5.4 defines :class:`Criticality` with
+four members and no ``UNKNOWN``, which made "we have no evidence" and "genuinely low
+stakes" indistinguishable. Neo.K approved adding ``UNKNOWN`` so §5.4 obeys the same
+rule as every other vocabulary here. Downstream code must therefore be explicit
+about *which* ordering it means — see the two rank tables below.
 """
 
 from __future__ import annotations
@@ -73,12 +72,38 @@ class Maturity(StrEnum):
 
 
 class Criticality(StrEnum):
-    """§5.4 Criticality."""
+    """§5.4 Criticality, extended with ``UNKNOWN`` (see the module docstring)."""
 
+    UNKNOWN = "UNKNOWN"
     LOW = "LOW"
     MEDIUM = "MEDIUM"
     HIGH = "HIGH"
     CRITICAL = "CRITICAL"
+
+
+#: **Evidence ordering** — for escalating away from a default while classifying.
+#: ``UNKNOWN`` is the floor: any observation at all, including "this is genuinely
+#: low stakes", beats never having looked.
+CRITICALITY_EVIDENCE_RANK: dict[Criticality, int] = {
+    Criticality.UNKNOWN: -1,
+    Criticality.LOW: 0,
+    Criticality.MEDIUM: 1,
+    Criticality.HIGH: 2,
+    Criticality.CRITICAL: 3,
+}
+
+#: **Risk ordering** — for deciding how dangerous an action is. ``UNKNOWN`` sits
+#: *above* ``MEDIUM``, not below ``LOW``: an ungraded repository is not a safe one,
+#: it is an unexamined one, and writing to it must never be cheaper than writing to
+#: something a human actually graded MEDIUM. Using the evidence ordering here would
+#: silently make "never classified" the safest thing in the portfolio.
+CRITICALITY_RISK_RANK: dict[Criticality, int] = {
+    Criticality.LOW: 0,
+    Criticality.MEDIUM: 1,
+    Criticality.UNKNOWN: 2,
+    Criticality.HIGH: 3,
+    Criticality.CRITICAL: 4,
+}
 
 
 class AgentAccess(StrEnum):

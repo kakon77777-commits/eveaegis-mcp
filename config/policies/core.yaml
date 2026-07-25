@@ -72,6 +72,14 @@ abac:
         criticality: [HIGH]
       require_approval: true
 
+    - id: ungraded-criticality-approval
+      description: >-
+        Nobody has graded how load-bearing this repository is. That is not the same
+        as it being unimportant, so a human confirms before anything writes to it.
+      when:
+        criticality: [UNKNOWN]
+      require_approval: true
+
     - id: public-repository-safety
       description: >-
         Anything written to a public repository is published. Agents propose;
@@ -209,6 +217,8 @@ risk:
     criticality:
       LOW: 0
       MEDIUM: 1
+      # Ungraded is not safe, it is unexamined: it costs more than a graded MEDIUM.
+      UNKNOWN: 2
       HIGH: 3
       CRITICAL: 5
     public_repository: 1

@@ -23,6 +23,8 @@ from eveaegis.models import ActionRequest, Actor
 from eveaegis.policy import TOOL_LEVELS, PolicyEngine, assess_risk, load_policies
 from eveaegis.policy.rules import DEFAULT_TOOL_LEVEL, PolicyRule
 from eveaegis.taxonomy import (
+    CRITICALITY_EVIDENCE_RANK,
+    CRITICALITY_RISK_RANK,
     ActorType,
     AgentAccess,
     Category,
@@ -822,3 +824,61 @@ class TestRiskScoring:
         level, reasons = assess_risk(make_request("get_portfolio_summary"), {}, {}, cfg)
         assert level == RiskLevel.LOW
         assert reasons
+
+
+class TestUngradedCriticality:
+    """§5.4 was extended with UNKNOWN; these pin down what that must mean.
+
+    Two orderings exist on purpose. The classifier escalates along the *evidence*
+    ordering, where UNKNOWN is the floor. The risk engine ranks along the *risk*
+    ordering, where UNKNOWN sits above MEDIUM. Collapsing them back into one table
+    would silently make "nobody ever classified it" the safest thing in the
+    portfolio, so both directions are asserted here.
+    """
+
+    def test_the_two_orderings_disagree_on_purpose(self) -> None:
+        assert CRITICALITY_EVIDENCE_RANK[Criticality.UNKNOWN] < CRITICALITY_EVIDENCE_RANK[
+            Criticality.LOW
+        ]
+        assert CRITICALITY_RISK_RANK[Criticality.UNKNOWN] > CRITICALITY_RISK_RANK[
+            Criticality.MEDIUM
+        ]
+
+    def test_ungraded_target_outranks_a_graded_low_one(
+        self, writable_core: GovernanceCore
+    ) -> None:
+        cfg = load_policies("config/policies")
+        add_repo(writable_core, "acme/graded", criticality=Criticality.LOW)
+        add_repo(writable_core, "acme/ungraded", criticality=Criticality.UNKNOWN)
+        repos = {r.full_name: r for r in _repos(writable_core)}
+
+        _, graded_reasons = assess_risk(
+            make_request("standardize_topics", ["acme/graded"]), repos, {}, cfg
+        )
+        _, ungraded_reasons = assess_risk(
+            make_request("standardize_topics", ["acme/ungraded"]), repos, {}, cfg
+        )
+        assert _score(ungraded_reasons) > _score(graded_reasons)
+        assert any("UNKNOWN" in r for r in ungraded_reasons)
+
+    def test_ungraded_target_requires_human_approval(
+        self, writable_core: GovernanceCore
+    ) -> None:
+        add_repo(writable_core, "acme/ungraded", criticality=Criticality.UNKNOWN)
+        decision = PolicyEngine(writable_core).evaluate(
+            make_request("standardize_topics", ["acme/ungraded"])
+        )
+        assert "ungraded-criticality-approval" in decision.matched_policies
+        assert decision.constraints.get("approval_required") is True
+
+
+def _score(reasons: list[str]) -> float:
+    """Pull the numeric score back out of the first reason line."""
+    head = reasons[0]
+    return float(head.split("risk score ", 1)[1].split(" ", 1)[0])
+
+
+def _repos(core: GovernanceCore) -> list[Any]:
+    from eveaegis.inventory.sync import row_to_asset
+
+    return [row_to_asset(r) for r in core.conn.execute("SELECT * FROM repositories")]

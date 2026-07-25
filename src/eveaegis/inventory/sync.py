@@ -587,7 +587,7 @@ class InventorySync:
             )
             row["category"] = str(Category.UNKNOWN)
             row["maturity"] = str(Maturity.UNKNOWN)
-            row["criticality"] = str(Criticality.LOW)
+            row["criticality"] = str(Criticality.UNKNOWN)
             row["agent_access"] = str(AgentAccess.READ_ONLY)
             row["policy_profile"] = "default"
         elif payload.get("archived") and existing["lifecycle"] == str(Lifecycle.UNKNOWN):

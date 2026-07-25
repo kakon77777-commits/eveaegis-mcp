@@ -19,7 +19,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Iterable
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 MIGRATIONS: dict[int, str] = {
     1: """
@@ -86,7 +86,7 @@ MIGRATIONS: dict[int, str] = {
         lifecycle            TEXT NOT NULL DEFAULT 'UNKNOWN',
         category             TEXT NOT NULL DEFAULT 'UNKNOWN',
         maturity             TEXT NOT NULL DEFAULT 'UNKNOWN',
-        criticality          TEXT NOT NULL DEFAULT 'LOW',
+        criticality          TEXT NOT NULL DEFAULT 'UNKNOWN',
         agent_access         TEXT NOT NULL DEFAULT 'READ_ONLY',
         origin_profile_id    TEXT,
         policy_profile       TEXT NOT NULL DEFAULT 'default',
@@ -295,6 +295,17 @@ MIGRATIONS: dict[int, str] = {
     ALTER TABLE classifications ADD COLUMN taxonomy_profile TEXT NOT NULL DEFAULT 'evemisslab-v1';
     CREATE INDEX IF NOT EXISTS idx_classifications_recent
         ON classifications(repository_id, created_at DESC);
+    """,
+    3: """
+    -- How hard we actually looked. A metadata-only verdict and one backed by a
+    -- bare-mirror commit/blob comparison carry very different weight, and storing
+    -- them identically made an unexamined repository look reviewed.
+    ALTER TABLE origin_profiles ADD COLUMN analysis_depth TEXT NOT NULL DEFAULT 'shallow';
+
+    -- One current profile per repository. Previously enforced only by convention
+    -- in the id scheme, which a second writer could have violated silently.
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_origin_one_per_repo
+        ON origin_profiles(repository_id);
     """,
 }
 

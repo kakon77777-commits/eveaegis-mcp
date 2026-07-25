@@ -143,7 +143,7 @@ class TestAmbiguityStaysUnknown:
         result = Classifier(core).classify("acme/thing")
         assert result.category == Category.UNKNOWN
         assert result.maturity == Maturity.UNKNOWN
-        assert result.criticality == Criticality.LOW  # least-privilege default
+        assert result.criticality == Criticality.UNKNOWN  # ungraded, not "low stakes"
         assert result.agent_access == AgentAccess.READ_ONLY
         assert any("UNKNOWN" in line for line in result.rationale)
 
