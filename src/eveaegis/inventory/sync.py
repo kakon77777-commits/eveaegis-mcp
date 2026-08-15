@@ -85,8 +85,12 @@ class InventoryResult(BaseModel):
 def repository_id(payload: dict[str, Any]) -> str:
     """``github:{owner_id}:{repo_id}`` — the §27 catalog identifier.
 
-    Numeric GitHub ids are used rather than ``full_name`` because both the owner
-    login and the repository name are renameable, while the ids are not.
+    Numeric GitHub ids are used rather than ``full_name`` because the owner login and
+    the repository name are both renameable. Note the limit of that reasoning: the
+    *owner* can change too, when a repository is transferred between accounts, so
+    this string is a **surrogate recording where a repository was first seen**, not a
+    stable identity. The stable identity is ``github_repository_id`` alone, which is
+    what :meth:`InventorySync._reconcile_identity` matches on.
     """
     owner_id = (payload.get("owner") or {}).get("id")
     repo_id = payload.get("id")
@@ -423,7 +427,12 @@ class InventorySync:
         full_name = payload["full_name"]
         conn = self.core.conn
 
-        existing = self._reconcile_identity(rid, full_name)
+        existing = self._reconcile_identity(rid, full_name, int(payload["id"]))
+        if existing is not None:
+            # Reconciliation may have matched a row filed under an earlier owner. Every
+            # snapshot and profile hangs off *that* surrogate id, so the rest of this
+            # ingest must use it rather than the id derived from today's owner.
+            rid = existing["id"]
 
         # parent/source only exist on the detailed endpoint, so pay for it exactly
         # where it matters: forks. Everything else is already in the list payload.
@@ -441,7 +450,9 @@ class InventorySync:
             languages=languages,
             existing=existing,
         )
-        upsert(conn, "repositories", row, keys=("tenant_id", "full_name"))
+        # `id` is insert-only: a transferred repository keeps the surrogate its history
+        # hangs off, even though today's owner would derive a different one.
+        upsert(conn, "repositories", row, keys=("tenant_id", "full_name"), skip_update=("id",))
 
         snapshots = 0
         snapshots += int(self._write_snapshot(rid, "repository", payload))
@@ -491,37 +502,70 @@ class InventorySync:
             ],
         }
 
-    def _reconcile_identity(self, rid: str, full_name: str) -> sqlite3.Row | None:
-        """Locate the existing row, healing a rename before the upsert runs.
+    def _reconcile_identity(
+        self, rid: str, full_name: str, github_repository_id: int
+    ) -> sqlite3.Row | None:
+        """Locate the existing row, healing a rename *or a transfer* before the upsert.
 
-        ``id`` is stable but ``full_name`` is the conflict key, so a renamed
-        repository would otherwise arrive as a second row and collide on the primary
-        key. Renaming the stored row first keeps the identity — and every snapshot
-        hanging off it — intact.
+        Three identifiers are in play and only one of them is actually stable:
+
+        * ``full_name`` changes on rename **and** on transfer;
+        * ``id`` is ``github:{owner_id}:{repo_id}``, so it changes on transfer too —
+          the §27 scheme used numeric ids because names are renameable, but ownership
+          is just as mutable;
+        * ``github_repository_id`` survives both. It is the real identity.
+
+        So the lookup is by numeric repository id, and the stored ``id`` is treated as
+        an opaque surrogate that merely records where the repository was first seen.
+        Rewriting it on transfer would orphan every snapshot, origin profile and
+        classification hanging off it — which is exactly the governance history a
+        personal-to-company move must not silently destroy.
         """
         conn = self.core.conn
-        by_id = conn.execute("SELECT * FROM repositories WHERE id = ?", (rid,)).fetchone()
+        by_repo = conn.execute(
+            "SELECT * FROM repositories WHERE tenant_id = ? AND github_repository_id = ?",
+            (self.core.tenant_id, github_repository_id),
+        ).fetchone()
         by_name = conn.execute(
             "SELECT * FROM repositories WHERE tenant_id = ? AND full_name = ?",
             (self.core.tenant_id, full_name),
         ).fetchone()
 
-        if by_id is not None and by_id["full_name"] != full_name:
-            if by_name is not None:
+        if by_repo is not None and by_repo["full_name"] != full_name:
+            if by_name is not None and by_name["id"] != by_repo["id"]:
                 raise ValueError(
                     f"full_name {full_name!r} is already held by {by_name['id']}; "
-                    f"cannot rename {rid}"
+                    f"cannot move {by_repo['id']}"
                 )
-            conn.execute("UPDATE repositories SET full_name = ? WHERE id = ?", (full_name, rid))
-            return conn.execute("SELECT * FROM repositories WHERE id = ?", (rid,)).fetchone()
-
-        if by_id is None and by_name is not None:
-            # Same name, different GitHub id: the original was deleted and recreated.
-            # Rewriting the primary key would orphan its snapshots, so stop and report.
-            raise ValueError(
-                f"{full_name} exists under id {by_name['id']} but GitHub now reports {rid}"
+            moved = by_repo["id"] != rid  # owner changed, not just the name
+            conn.execute(
+                "UPDATE repositories SET full_name = ? WHERE id = ?", (full_name, by_repo["id"])
             )
-        return by_id
+            self.core.ledger.record(
+                "inventory_repository_moved" if moved else "inventory_repository_renamed",
+                tenant=self.core.tenant_id,
+                targets=[full_name],
+                detail={
+                    "from": by_repo["full_name"],
+                    "to": full_name,
+                    "surrogate_id": by_repo["id"],
+                    "github_repository_id": github_repository_id,
+                    "note": "governance history preserved under the original surrogate id",
+                },
+            )
+            return conn.execute(
+                "SELECT * FROM repositories WHERE id = ?", (by_repo["id"],)
+            ).fetchone()
+
+        if by_repo is None and by_name is not None:
+            # Same name, different GitHub repository: the original was deleted and
+            # recreated. Rewriting the primary key would orphan its snapshots, so stop
+            # and report rather than silently repointing the history at a new project.
+            raise ValueError(
+                f"{full_name} exists under id {by_name['id']} but GitHub now reports "
+                f"repository id {github_repository_id}"
+            )
+        return by_repo
 
     def _repository_row(
         self,

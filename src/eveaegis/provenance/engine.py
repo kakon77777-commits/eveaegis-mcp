@@ -1210,6 +1210,7 @@ class ProvenanceEngine:
             confidence=confidence,
             bundle=bundle,
             contribution=contribution,
+            signal_tier=evaluation.matched.signal_tier if evaluation.matched else "fallback",
         )
 
         for note in evaluation.notes:
@@ -1447,21 +1448,36 @@ _NON_EFFECTIVE = {
 # §23 public/internal separation
 # --------------------------------------------------------------------------
 
+#: Tiers where the verdict rests on something GitHub itself asserts, rather than on
+#: anything this engine inferred. A repository GitHub reports as a fork *is* a fork;
+#: there is no judgement for a human to add.
+_AUTHORITATIVE_TIERS: frozenset[str] = frozenset({"fork_metadata"})
+
+#: Confidence at or above which an authoritative-tier verdict counts as settled.
+SETTLED_CONFIDENCE = 0.99
+
+
 def _public_label(
     *,
     origin_type: OriginType,
     confidence: float,
     bundle: RepositoryEvidenceBundle,
     contribution: ContributionEstimate,
+    signal_tier: str = "fallback",
 ) -> tuple[PublicLabel, ReviewStatus]:
     """Derive the outward-facing label. The single gate for axiom 4.
 
     Three independent tests must all pass before any originality claim is emitted:
     the origin type must not be in :data:`NO_AUTOMATIC_ORIGINALITY_CLAIM`, the
     confidence must clear :data:`ORIGINALITY_CLAIM_THRESHOLD`, and the origin type
-    must appear in :data:`_CLAIMABLE`. Anything else is ``"none"`` plus
-    ``NEEDS_REVIEW`` — the conservative answer is always reachable, and it is the
-    default.
+    must appear in :data:`_CLAIMABLE`. Anything else publishes ``"none"``.
+
+    Refusing to claim and *needing a human* are two different things, and conflating
+    them is what floods the review queue. A repository GitHub itself reports as a
+    fork is settled: no claim is made, and no human decision is pending either, so it
+    is ``UNREVIEWED`` rather than ``NEEDS_REVIEW``. Human review is reserved for the
+    cases that actually need judgement — the engine is unsure, or a public claim is
+    on the table. A queue that never empties is a queue nobody reads.
     """
     upstream = bundle.upstream_candidates
     attribution = f"Based on {upstream[0].full_name}" if upstream else None
@@ -1470,13 +1486,40 @@ def _public_label(
     under_confident = confidence < ORIGINALITY_CLAIM_THRESHOLD
     claim = _CLAIMABLE.get(origin_type)
 
+    # A licence question outranks the origin verdict — but only when it is *ours* to
+    # answer. In an untouched fork the embedded licences are the upstream project's
+    # own arrangement: large projects vendor third-party code, and that is their
+    # structure, not a task for whoever forked them. It becomes our question when we
+    # start making it our own version, which is exactly when local contribution rises.
+    # Recording it as our legal review item before that misattributes whose problem
+    # it is — the same category error as reading a dependency as the project itself.
+    licence_unresolved = bundle.license_status in {
+        LicenseStatus.COPYLEFT_TRIGGERED,
+        LicenseStatus.INCOMPATIBLE,
+        LicenseStatus.REVIEW_REQUIRED,
+    }
+    barely_ours = origin_type in NO_AUTOMATIC_ORIGINALITY_CLAIM and contribution.band in {
+        ContributionBand.MINIMAL,
+        ContributionBand.LIMITED,
+    }
+    # The status itself stays on the profile either way; only the *assignment* moves.
+    licence_hold = licence_unresolved and not barely_ours
+
     if forbidden or under_confident or claim is None:
         label = PublicLabel(
             label=_PUBLIC_LABELS.get(origin_type, _PUBLIC_LABELS[OriginType.UNKNOWN]),
             attribution=attribution,
             originality_claim="none",
         )
-        return label, ReviewStatus.NEEDS_REVIEW
+        if licence_hold:
+            return label, ReviewStatus.LEGAL_REVIEW_REQUESTED
+        settled = (
+            forbidden
+            and signal_tier in _AUTHORITATIVE_TIERS
+            and confidence >= SETTLED_CONFIDENCE
+            and origin_type is not OriginType.UNKNOWN
+        )
+        return label, (ReviewStatus.UNREVIEWED if settled else ReviewStatus.NEEDS_REVIEW)
 
     # A claim is permitted. §8.1 still forbids publishing a bare percentage, so the
     # band — never the number — is what accompanies it.

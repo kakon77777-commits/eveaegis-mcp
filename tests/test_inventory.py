@@ -537,7 +537,83 @@ def test_recreated_repository_is_reported_not_silently_repointed(core: Governanc
 
     assert result.repositories == 0
     assert len(result.errors) == 1
-    assert "github:100:999" in result.errors[0]
+    # Identity is now the numeric repository id, so that is what the error names.
+    assert "999" in result.errors[0]
+    assert "github:100:200" in result.errors[0]
+
+
+# --------------------------------------------------------------------------
+# transfer between accounts (§4 personal/company separation)
+# --------------------------------------------------------------------------
+
+def test_transfer_between_accounts_preserves_governance_history(
+    core: GovernanceCore,
+) -> None:
+    """Moving a repository personal -> org must not reset what is known about it.
+
+    The surrogate id embeds the owner, so a transfer changes both the id and the
+    full_name and would otherwise look like a brand-new repository — silently, since
+    the delete-and-recreate guard only fires when the *name* is reused. Everything
+    downstream (snapshots, origin profile, classification) hangs off the surrogate,
+    so a fresh row would strand the whole governance history on a dead one.
+    """
+    client = bind(core, FakeGitHubClient(user_repos=[repo_payload()]))
+    sync = InventorySync(core)
+    sync.sync_repositories(include_readme=False, include_languages=False, include_tree=False)
+
+    original = sync.load_repository("octo/alpha")
+    assert original is not None
+    surrogate = original.id
+
+    # A human graded it before the move.
+    core.conn.execute(
+        "UPDATE repositories SET criticality = ?, category = ? WHERE id = ?",
+        (str(Criticality.HIGH), str(Category.RESEARCH), surrogate),
+    )
+    core.conn.commit()
+
+    # Same repository, new owner: repo_id unchanged, owner_id and full_name changed.
+    client._user_repos = [repo_payload(owner_id=777, owner_login="evemisslab")]
+    result = sync.sync_repositories(
+        include_readme=False, include_languages=False, include_tree=False
+    )
+
+    assert result.errors == []
+    assert result.created == 0 and result.updated == 1
+
+    rows = core.conn.execute("SELECT id, full_name FROM repositories").fetchall()
+    assert len(rows) == 1, "a transfer must not produce a second row"
+    assert rows[0]["id"] == surrogate, "the surrogate id must survive the move"
+    assert rows[0]["full_name"] == "evemisslab/alpha"
+
+    moved = sync.load_repository("evemisslab/alpha")
+    assert moved is not None
+    assert moved.criticality is Criticality.HIGH
+    assert moved.category is Category.RESEARCH
+
+    actions = [e.action for e in core.ledger.recent(20)]
+    assert "inventory_repository_moved" in actions
+
+
+def test_transfer_snapshots_stay_attached(core: GovernanceCore) -> None:
+    """Snapshots must keep landing on the same surrogate after a move."""
+    client = bind(
+        core,
+        FakeGitHubClient(user_repos=[repo_payload()], readmes={"octo/alpha": "# alpha"}),
+    )
+    sync = InventorySync(core)
+    sync.sync_repositories(include_languages=False, include_tree=False)
+    surrogate = sync.load_repository("octo/alpha").id  # type: ignore[union-attr]
+
+    client._user_repos = [repo_payload(owner_id=777, owner_login="evemisslab")]
+    client._readmes = {"evemisslab/alpha": "# alpha, after the move"}
+    sync.sync_repositories(include_languages=False, include_tree=False)
+
+    owners = {
+        r["repository_id"]
+        for r in core.conn.execute("SELECT DISTINCT repository_id FROM repository_snapshots")
+    }
+    assert owners == {surrogate}
 
 
 # --------------------------------------------------------------------------

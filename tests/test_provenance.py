@@ -941,3 +941,99 @@ class TestLicenceProseIsNotAnEmbeddedLicence:
         summary = self._paths(["LICENSE", "src/main.py"])
         assert summary.embedded_license_files == []
         assert summary.license_files == ["LICENSE"]
+
+
+class TestRefusingToClaimIsNotTheSameAsNeedingAHuman:
+    """A settled fork makes no claim *and* needs no decision.
+
+    On the live portfolio every one of 16 forks sat in NEEDS_REVIEW at confidence
+    1.00, saying the same thing GitHub already says. At 100 forks that is a queue
+    nobody reads — and a queue nobody reads means nothing ever becomes publishable,
+    because publishing requires human review. Human review is for cases that need
+    judgement: the engine is unsure, or a claim is on the table.
+    """
+
+    def test_fork_from_github_metadata_is_settled_not_pending(self) -> None:
+        label, review = _public_label(
+            origin_type=OriginType.GITHUB_FORK,
+            confidence=1.0,
+            bundle=_bundle(),
+            contribution=ContributionEstimate(band=ContributionBand.LIMITED),
+            signal_tier="fork_metadata",
+        )
+        assert label.originality_claim == "none"   # axiom 4 still holds
+        assert review is ReviewStatus.UNREVIEWED   # but nothing is pending
+
+    def test_settled_forks_drop_out_of_the_review_queue(self) -> None:
+        """The queue already filters correctly; only the status assignment was wrong."""
+        _, review = _public_label(
+            origin_type=OriginType.GITHUB_FORK,
+            confidence=1.0,
+            bundle=_bundle(),
+            contribution=ContributionEstimate(band=ContributionBand.LIMITED),
+            signal_tier="fork_metadata",
+        )
+        # review_queue() selects NEEDS_REVIEW / LEGAL_REVIEW_REQUESTED, plus UNREVIEWED
+        # rows that carry a public claim. A settled fork matches none of those.
+        assert review not in {ReviewStatus.NEEDS_REVIEW, ReviewStatus.LEGAL_REVIEW_REQUESTED}
+
+    def test_an_inferred_fork_still_needs_a_human(self) -> None:
+        """Detached forks rest on our inference, not on GitHub's own assertion."""
+        _, review = _public_label(
+            origin_type=OriginType.DETACHED_FORK,
+            confidence=0.95,
+            bundle=_bundle(),
+            contribution=ContributionEstimate(band=ContributionBand.MIXED),
+            signal_tier="commit_ancestry",
+        )
+        assert review is ReviewStatus.NEEDS_REVIEW
+
+    def test_unknown_origin_is_never_settled(self) -> None:
+        """Whatever tier it claims, "we could not tell" is the definition of pending."""
+        _, review = _public_label(
+            origin_type=OriginType.UNKNOWN,
+            confidence=1.0,
+            bundle=_bundle(),
+            contribution=ContributionEstimate(),
+            signal_tier="fork_metadata",
+        )
+        assert review is ReviewStatus.NEEDS_REVIEW
+
+    def test_upstreams_licence_structure_is_not_our_review_task(self) -> None:
+        """An untouched fork inherits upstream's vendoring, not a legal task.
+
+        Eight of the sixteen live forks were flagged because the *upstream* project
+        vendors third-party code with licence files. That is the upstream's own
+        arrangement; assigning it to whoever forked them misattributes whose question
+        it is.
+        """
+        label, review = _public_label(
+            origin_type=OriginType.GITHUB_FORK,
+            confidence=1.0,
+            bundle=_bundle(LicenseStatus.REVIEW_REQUIRED),
+            contribution=ContributionEstimate(band=ContributionBand.LIMITED),
+            signal_tier="fork_metadata",
+        )
+        assert label.originality_claim == "none"
+        assert review is ReviewStatus.UNREVIEWED
+
+    def test_licence_becomes_ours_once_we_make_it_our_own_version(self) -> None:
+        """fork -> study -> own version is exactly when the question transfers."""
+        _, review = _public_label(
+            origin_type=OriginType.DETACHED_FORK,
+            confidence=0.95,
+            bundle=_bundle(LicenseStatus.COPYLEFT_TRIGGERED),
+            contribution=ContributionEstimate(band=ContributionBand.SUBSTANTIAL),
+            signal_tier="commit_ancestry",
+        )
+        assert review is ReviewStatus.LEGAL_REVIEW_REQUESTED
+
+    def test_licence_hold_on_our_own_project_still_reaches_a_human(self) -> None:
+        _, review = _public_label(
+            origin_type=OriginType.ORIGINAL_WITH_DEPENDENCIES,
+            confidence=0.95,
+            bundle=_bundle(LicenseStatus.COPYLEFT_TRIGGERED),
+            contribution=ContributionEstimate(band=ContributionBand.NEARLY_FULL),
+            signal_tier="structural",
+        )
+        assert review is ReviewStatus.LEGAL_REVIEW_REQUESTED
