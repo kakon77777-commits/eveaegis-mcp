@@ -75,6 +75,8 @@ class FakeGitHubClient:
         readmes: dict[str, str | None] | None = None,
         trees: dict[str, list[dict[str, Any]]] | None = None,
         fail_on: dict[str, Exception] | None = None,
+        identity_mode: str = "user",
+        installation_repos: list[dict[str, Any]] | None = None,
     ) -> None:
         self._viewer = viewer or {"id": 100, "login": "octo"}
         self._orgs = orgs or []
@@ -84,6 +86,8 @@ class FakeGitHubClient:
         self._readmes = readmes or {}
         self._trees = trees or {}
         self._fail_on = fail_on or {}
+        self._identity_mode = identity_mode
+        self._installation_repos = installation_repos or []
         self.request_count = 0
         self.closed = False
 
@@ -103,6 +107,20 @@ class FakeGitHubClient:
     @property
     def credential_description(self) -> dict[str, str]:
         return {"backend": "fake", "credential_type": "fake_token", "scope": "read_content"}
+
+    @property
+    def identity_mode(self) -> str:
+        return self._identity_mode
+
+    def installation_repos(self) -> Iterator[dict[str, Any]]:
+        """App-token discovery: one listing spanning every covered account."""
+        self.request_count += 1
+        self._boom("installation_repos")
+        return iter(self._installation_repos)
+
+    def user_repos_forbidden(self) -> None:
+        """Installation tokens get 403 on every /user* endpoint. Mirror that."""
+        raise RuntimeError("Resource not accessible by integration")
 
     def _boom(self, key: str) -> None:
         exc = self._fail_on.get(key)
@@ -748,3 +766,104 @@ def test_reports_reflect_the_catalog(core: GovernanceCore) -> None:
     assert [a.full_name for a in sync.list_repositories(only_unclassified=True)] == [
         a.full_name for a in sync.list_repositories()
     ]
+
+
+# --------------------------------------------------------------------------
+# GitHub App installation discovery
+# --------------------------------------------------------------------------
+
+class TestInstallationModeDiscovery:
+    """An installation token acts as the App, not as a person.
+
+    Every ``/user*`` endpoint answers 403 "Resource not accessible by integration",
+    so the user-shaped discovery path cannot work at all under a GitHub App — the
+    sweep would report zero repositories rather than fail loudly.
+    """
+
+    @staticmethod
+    def _client(**kw: Any) -> FakeGitHubClient:
+        return FakeGitHubClient(
+            identity_mode="installation",
+            fail_on={
+                "viewer": RuntimeError("403 Resource not accessible by integration"),
+                "orgs": RuntimeError("403 Resource not accessible by integration"),
+                "user_repos": RuntimeError("403 Resource not accessible by integration"),
+            },
+            **kw,
+        )
+
+    def test_installation_sweep_never_touches_user_endpoints(
+        self, core: GovernanceCore
+    ) -> None:
+        bind(core, self._client(installation_repos=[repo_payload()]))
+        result = InventorySync(core).sync_repositories(
+            include_readme=False, include_languages=False, include_tree=False
+        )
+        assert result.errors == []
+        assert result.repositories == 1
+
+    def test_accounts_are_derived_from_the_repositories_granted(
+        self, core: GovernanceCore
+    ) -> None:
+        """Not from org membership: report what the App was granted, not who he is."""
+        bind(
+            core,
+            self._client(
+                installation_repos=[
+                    repo_payload(),
+                    repo_payload(
+                        owner_id=900,
+                        owner_login="evemisslab",
+                        repo_id=901,
+                        name="company-thing",
+                        owner={"id": 900, "login": "evemisslab", "type": "Organization"},
+                    ),
+                ]
+            ),
+        )
+        installs = InventorySync(core).sync_accounts()
+        assert {i.account_login for i in installs} == {"octo", "evemisslab"}
+        assert {i.account_type for i in installs} == {"user", "organization"}
+        # The installation id is recorded now, unlike the delegated-token path.
+        rows = core.conn.execute("SELECT DISTINCT installation_id FROM github_installations")
+        assert {r["installation_id"] for r in rows} == {core.cfg.credentials.installation_id}
+
+    def test_the_listing_is_fetched_once_not_per_account(
+        self, core: GovernanceCore
+    ) -> None:
+        """One endpoint already spans every account; fanning out would re-pay for it."""
+        client = bind(
+            core,
+            self._client(
+                installation_repos=[
+                    repo_payload(),
+                    repo_payload(
+                        owner_id=900,
+                        owner_login="evemisslab",
+                        repo_id=901,
+                        name="company-thing",
+                        owner={"id": 900, "login": "evemisslab", "type": "Organization"},
+                    ),
+                ]
+            ),
+        )
+        InventorySync(core).sync_repositories(
+            include_readme=False, include_languages=False, include_tree=False
+        )
+        assert client.request_count == 1
+
+    def test_installation_failure_is_reported_not_silently_empty(
+        self, core: GovernanceCore
+    ) -> None:
+        bind(
+            core,
+            FakeGitHubClient(
+                identity_mode="installation",
+                fail_on={"installation_repos": RuntimeError("App suspended")},
+            ),
+        )
+        result = InventorySync(core).sync_repositories(
+            include_readme=False, include_languages=False, include_tree=False
+        )
+        assert result.repositories == 0
+        assert any("App suspended" in e for e in result.errors)

@@ -41,6 +41,7 @@ SCOPE_PERMISSIONS: dict[TokenScope, dict[str, str]] = {
 class GitHubAppBroker(CredentialBroker):
     name = "github_app"
     max_scope = TokenScope.ADMIN
+    identity_mode = "installation"
 
     def __init__(
         self,

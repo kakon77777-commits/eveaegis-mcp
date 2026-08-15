@@ -24,6 +24,45 @@ API_VERSION = "2022-11-28"
 USER_AGENT = "EveAegis/0.1 (+https://github.com/kakon77777-commits/eveaegis-mcp)"
 
 
+#: Keys GitHub uses to wrap a paginated collection alongside ``total_count``. Search
+#: uses ``items``; the installation, workflow and check endpoints each use their own.
+#: Hardcoding only ``items`` made every other wrapped endpoint paginate to nothing —
+#: silently, since an empty page is indistinguishable from an exhausted one.
+_COLLECTION_KEYS: tuple[str, ...] = (
+    "items",
+    "repositories",
+    "installations",
+    "workflow_runs",
+    "artifacts",
+    "check_runs",
+    "check_suites",
+    "jobs",
+    "secrets",
+    "variables",
+)
+
+
+def _unwrap_collection(payload: dict[str, Any], path: str) -> list[Any]:
+    """Pull the list out of a wrapped collection response.
+
+    Falls back to the sole list-valued key when the wrapper is one we have not seen,
+    and refuses to guess when several are present — returning the wrong list quietly
+    would be worse than failing here.
+    """
+    for key in _COLLECTION_KEYS:
+        value = payload.get(key)
+        if isinstance(value, list):
+            return value
+    lists = [v for v in payload.values() if isinstance(v, list)]
+    if len(lists) == 1:
+        return lists[0]
+    raise GitHubError(
+        200,
+        f"paginated response has no recognizable collection key (saw {sorted(payload)})",
+        path,
+    )
+
+
 class GitHubError(RuntimeError):
     def __init__(self, status: int, message: str, path: str) -> None:
         super().__init__(f"GitHub {status} on {path}: {message}")
@@ -194,8 +233,8 @@ class GitHubClient:
             batch = self.get(path, params=page_params)
             if not batch:
                 return
-            if isinstance(batch, dict):  # search endpoints wrap results
-                batch = batch.get("items", [])
+            if isinstance(batch, dict):
+                batch = _unwrap_collection(batch, path)
             for item in batch:
                 yield item
                 yielded += 1
@@ -220,6 +259,20 @@ class GitHubClient:
 
     def orgs(self) -> list[dict[str, Any]]:
         return list(self.paginate("/user/orgs"))
+
+    @property
+    def identity_mode(self) -> str:
+        """``"user"`` or ``"installation"`` — see :class:`CredentialBroker`."""
+        return self.broker.identity_mode
+
+    def installation_repos(self) -> Iterator[dict[str, Any]]:
+        """Every repository this App installation can reach, across all its accounts.
+
+        The App-token equivalent of ``user_repos`` + ``org_repos`` combined: one
+        endpoint already spans the personal account and every organization the
+        installation covers, so there is nothing to fan out over.
+        """
+        return self.paginate("/installation/repositories")
 
     def user_repos(self, affiliation: str = "owner") -> Iterator[dict[str, Any]]:
         return self.paginate("/user/repos", params={"affiliation": affiliation, "sort": "pushed"})

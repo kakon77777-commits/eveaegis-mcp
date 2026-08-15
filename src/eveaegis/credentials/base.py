@@ -116,6 +116,16 @@ class CredentialBroker(abc.ABC):
     name: str = "abstract"
     #: Highest scope this backend is permitted to issue at all.
     max_scope: TokenScope = TokenScope.READ_METADATA
+    #: Which discovery surface the minted credential can actually reach.
+    #:
+    #: ``"user"``     — a delegated user token: ``/user``, ``/user/repos``, ``/user/orgs``.
+    #: ``"installation"`` — an App installation token, which acts as the *App*, not as
+    #: a person. Every ``/user*`` endpoint answers 403 "Resource not accessible by
+    #: integration"; the equivalent surface is ``/installation/repositories``.
+    #:
+    #: This is a property of the credential, not of the caller, so it lives here
+    #: rather than being sniffed downstream.
+    identity_mode: str = "user"
 
     def __init__(self, *, max_lifetime_seconds: int = 600) -> None:
         self.max_lifetime_seconds = max_lifetime_seconds

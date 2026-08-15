@@ -162,6 +162,9 @@ class InventorySync:
 
     def __init__(self, core: GovernanceCore) -> None:
         self.core = core
+        #: Installation-mode listing, fetched once during account discovery and
+        #: reused by the repository sweep. ``None`` means "not fetched yet".
+        self._installation_repo_cache: list[dict[str, Any]] | None = None
 
     # -- public API -------------------------------------------------------
 
@@ -322,17 +325,12 @@ class InventorySync:
         *,
         credential: dict[str, str],
     ) -> list[GitHubInstallation]:
-        accounts: list[tuple[dict[str, Any], str]] = []
-        try:
-            accounts.append((gh.viewer(), "user"))
-        except Exception as exc:
-            self._record_error("<viewer>", exc, errors, credential)
+        if gh.identity_mode == "installation":
+            accounts = self._installation_accounts(gh, errors, credential)
+        else:
+            accounts = self._user_accounts(gh, errors, credential)
+        if not accounts:
             return []
-        try:
-            accounts.extend((org, "organization") for org in gh.orgs())
-        except Exception as exc:
-            # A gh CLI token without `read:org` still yields a usable personal sweep.
-            self._record_error("<orgs>", exc, errors, credential)
 
         now = datetime.now(timezone.utc).isoformat()
         installations: list[GitHubInstallation] = []
@@ -342,10 +340,9 @@ class InventorySync:
                 tenant_id=self.core.tenant_id,
                 account_login=payload["login"],
                 account_type=kind,
-                # NULL until the GitHub App path exists; the gh CLI token is a
-                # delegated user token, not an installation.
-                installation_id=None,
-                # A delegated user token is account-wide by construction.
+                installation_id=self.core.cfg.credentials.installation_id
+                if gh.identity_mode == "installation"
+                else None,
                 allowed_repositories="all",
                 credential_backend=str(credential.get("backend", "gh_cli")),
             )
@@ -368,6 +365,52 @@ class InventorySync:
             installations.append(install)
         self.core.conn.commit()
         return installations
+
+    def _user_accounts(
+        self, gh: GitHubClient, errors: list[str], credential: dict[str, str]
+    ) -> list[tuple[dict[str, Any], str]]:
+        """Discovery for a delegated user token: the person, then their orgs."""
+        accounts: list[tuple[dict[str, Any], str]] = []
+        try:
+            accounts.append((gh.viewer(), "user"))
+        except Exception as exc:
+            self._record_error("<viewer>", exc, errors, credential)
+            return []
+        try:
+            accounts.extend((org, "organization") for org in gh.orgs())
+        except Exception as exc:
+            # A gh CLI token without `read:org` still yields a usable personal sweep.
+            self._record_error("<orgs>", exc, errors, credential)
+        return accounts
+
+    def _installation_accounts(
+        self, gh: GitHubClient, errors: list[str], credential: dict[str, str]
+    ) -> list[tuple[dict[str, Any], str]]:
+        """Discovery for an App installation token.
+
+        An installation token acts as the *App*, not as a person, so every
+        ``/user*`` endpoint answers 403. The accounts an installation covers are
+        therefore derived from the owners of the repositories it can reach — which
+        is also more honest than asking for org membership: it reports the accounts
+        the App was actually granted, not the accounts the human belongs to.
+        """
+        try:
+            repos = list(gh.installation_repos())
+        except Exception as exc:
+            self._record_error("<installation>", exc, errors, credential)
+            return []
+
+        seen: dict[str, tuple[dict[str, Any], str]] = {}
+        for repo in repos:
+            owner = repo.get("owner") or {}
+            login = owner.get("login")
+            if not login or login in seen:
+                continue
+            kind = "organization" if owner.get("type") == "Organization" else "user"
+            seen[login] = (owner, kind)
+        # Cache so the repository sweep does not pay for the same listing twice.
+        self._installation_repo_cache = repos
+        return list(seen.values())
 
     def _installation_for(self, login: str) -> GitHubInstallation | None:
         row = self.core.conn.execute(
@@ -399,7 +442,25 @@ class InventorySync:
         """Yield ``(payload, owning installation)`` for every reachable repository.
 
         Each source is isolated: an org that denies listing costs that org only.
+
+        Under an App installation there is only one source — ``/installation/
+        repositories`` already spans every account the installation covers — so the
+        listing fetched during account discovery is reused rather than re-requested.
         """
+        if gh.identity_mode == "installation":
+            by_login = {i.account_login.lower(): i for i in installations}
+            repos = getattr(self, "_installation_repo_cache", None)
+            if repos is None:
+                try:
+                    repos = list(gh.installation_repos())
+                except Exception as exc:
+                    self._record_error("<installation>", exc, errors, credential)
+                    return
+            for payload in repos:
+                login = ((payload.get("owner") or {}).get("login") or "").lower()
+                yield payload, by_login.get(login)
+            return
+
         for install in installations:
             try:
                 if install.account_type == "user":
