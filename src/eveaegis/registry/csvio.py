@@ -35,6 +35,7 @@ TEMPLATE_COLUMNS: tuple[str, ...] = (
 #: Appended after the template: machine opinion, clearly labelled as such.
 PROPOSAL_COLUMNS: tuple[str, ...] = (
     "proposed_class", "class_confidence", "class_rationale", "proposed_family",
+    "proposed_mode", "mixed_score", "mixed_reasons",
     "origin_confidence", "review_status", "is_fork", "is_archived", "pushed_at", "size_mb",
 )
 
@@ -55,6 +56,7 @@ def export_rows(core: GovernanceCore) -> list[dict[str, Any]]:
     decls = store.declarations()
     p_class = store.latest_proposals("asset_class")
     p_family = store.latest_proposals("project_family")
+    p_mode = store.latest_proposals("migration_mode")
 
     rows = core.conn.execute(
         """
@@ -72,6 +74,7 @@ def export_rows(core: GovernanceCore) -> list[dict[str, Any]]:
         d = decls.get(r["id"]) or Declaration(repository_id=r["id"])
         pc = p_class.get(r["id"])
         pf = p_family.get(r["id"])
+        pm = p_mode.get(r["id"])
         out.append(
             {
                 "repository_id": r["id"],
@@ -109,6 +112,9 @@ def export_rows(core: GovernanceCore) -> list[dict[str, Any]]:
                 "class_confidence": f"{pc.confidence:.2f}" if pc else "",
                 "class_rationale": pc.rationale if pc else "",
                 "proposed_family": pf.value if pf else "",
+                "proposed_mode": pm.value if pm else "",
+                "mixed_score": f"{max(0.0, pm.confidence - 0.4):.2f}" if pm else "",
+                "mixed_reasons": pm.rationale if pm else "",
                 "origin_confidence": f"{r['origin_confidence']:.2f}" if r["origin_confidence"] is not None else "",
                 "review_status": r["review_status"] or "",
                 "is_fork": int(r["is_fork"]),

@@ -430,6 +430,40 @@ def registry_propose(config: Optional[str] = typer.Option(None, "--config", "-c"
         core.close()
 
 
+@registry_app.command("relations")
+def registry_relations(config: Optional[str] = typer.Option(None, "--config", "-c")) -> None:
+    """Extract the project graph (README links, names, supersession language) as proposals."""
+    from .registry import extract_edges, record_edges
+
+    core = _core(config)
+    try:
+        edges = extract_edges(core)
+        n = record_edges(core, edges)
+        console.print(f"[green]{len(edges)} edges[/green] proposed ({n} recorded), "
+                      f"{sum(1 for e in edges if e.confidence >= 0.6)} with strong evidence")
+    finally:
+        core.close()
+
+
+@registry_app.command("report")
+def registry_report(
+    path: str = typer.Argument("workspace/reorg.md"),
+    config: Optional[str] = typer.Option(None, "--config", "-c"),
+) -> None:
+    """Write the reorganization report: families, orphans, supersession, clean-split candidates."""
+    from pathlib import Path
+
+    from .registry import write_reorg_report
+
+    core = _core(config)
+    try:
+        d = write_reorg_report(core, Path(path) if Path(path).is_absolute() else core.cfg.resolve(path))
+        console.print(f"[green]report[/green] {len(d['repos'])} repos, {len(d['families'])} families, "
+                      f"{len(d['orphans'])} orphans, {len(d['edges'])} edges -> {path}")
+    finally:
+        core.close()
+
+
 @registry_app.command("export")
 def registry_export(
     path: str = typer.Argument("workspace/registry.csv"),
