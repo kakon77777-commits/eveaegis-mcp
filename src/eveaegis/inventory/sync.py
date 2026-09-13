@@ -418,8 +418,20 @@ class InventorySync:
 
         seen: dict[str, tuple[dict[str, Any], str]] = {}
         all_repos: list[dict[str, Any]] = []
+        allowed = {a.lower() for a in self.core.cfg.governance.accounts}
         for inst in installs:
             inst_id = int(inst["id"])
+            login = str(inst.get("login") or "")
+            # A public App can be installed by anyone on their own account. That
+            # installation is real, but it is not ours to govern: skip it loudly.
+            if allowed and login.lower() not in allowed:
+                self.core.ledger.record(
+                    "inventory_installation_ignored",
+                    tenant=self.core.tenant_id,
+                    detail={"installation_id": inst_id, "account": login,
+                            "reason": "account not in governance.accounts"},
+                )
+                continue
             try:
                 with self.core.client(TokenScope.READ_METADATA, reason="installation discovery",
                                       installation_id=inst_id) as igh:

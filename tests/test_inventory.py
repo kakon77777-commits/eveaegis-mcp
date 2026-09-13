@@ -1007,3 +1007,21 @@ def test_an_empty_new_org_is_still_recorded(core: GovernanceCore) -> None:
     InventorySync(core).sync_repositories(include_readme=False, include_languages=False, include_tree=False)
     rows = {r["account_login"]: r for r in core.conn.execute("SELECT * FROM github_installations")}
     assert "EveMissLab" in rows and rows["EveMissLab"]["installation_id"] == 2
+
+
+def test_foreign_installation_is_ignored_not_swept(core: GovernanceCore) -> None:
+    """A public App can be installed by strangers; their repos must never enter the catalog."""
+    core.cfg.governance.accounts = ["octo"]
+    core.broker.installations = lambda: [  # type: ignore[method-assign]
+        {"id": 1, "login": "octo", "type": "User", "account_id": 100, "repository_selection": "all", "permissions": {}},
+        {"id": 99, "login": "stranger", "type": "User", "account_id": 555, "repository_selection": "all", "permissions": {}},
+    ]
+    listings = {1: [repo_payload()], 99: [repo_payload(owner_id=555, owner_login="stranger", repo_id=556, name="theirs")]}
+    core.client = lambda *a, **k: FakeGitHubClient(  # type: ignore[method-assign]
+        identity_mode="installation", installation_repos=listings.get(k.get("installation_id") or 0, [])
+    )
+    result = InventorySync(core).sync_repositories(include_readme=False, include_languages=False, include_tree=False)
+    assert result.repositories == 1
+    assert {r["full_name"] for r in core.conn.execute("SELECT full_name FROM repositories")} == {"octo/alpha"}
+    assert "stranger" not in {r["account_login"] for r in core.conn.execute("SELECT account_login FROM github_installations")}
+    assert any(e.action == "inventory_installation_ignored" for e in core.ledger.recent(10))

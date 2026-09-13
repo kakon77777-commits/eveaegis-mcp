@@ -57,3 +57,7 @@ governance:
   # Phase 0 default. Flip to false only once the write path has been reviewed.
   read_only: true
   require_human_approval: true
+  # Accounts this tenant governs. Installations on any other login are ignored.
+  accounts:
+    - kakon77777-commits
+    - EveMissLab

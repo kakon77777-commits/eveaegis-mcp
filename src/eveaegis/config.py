@@ -88,6 +88,11 @@ class GovernanceConfig(BaseModel):
     #: Read-only mode refuses every write tool regardless of policy (Phase 0 default).
     read_only: bool = True
     require_human_approval: bool = True
+    #: GitHub account logins this tenant governs. Once the App is public, anyone can
+    #: install it on their own account; an installation on a login not listed here
+    #: is ignored and recorded, never swept into the catalog. Empty = only the
+    #: App owner's account.
+    accounts: list[str] = Field(default_factory=list)
 
 
 class Config(BaseModel):
