@@ -118,6 +118,9 @@ class RepositoryAsset(Base):
     origin_profile_id: str | None = None
     policy_profile: str = "default"
 
+    #: Set when a sweep no longer sees the repository on GitHub; cleared when it
+    #: reappears. The row itself is kept — its governance history is the record.
+    missing_since: datetime | None = None
     synced_at: datetime = Field(default_factory=utcnow)
 
 

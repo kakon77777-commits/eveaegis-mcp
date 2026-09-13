@@ -28,7 +28,7 @@ def _count(conn: sqlite3.Connection, sql: str, params: tuple[Any, ...]) -> int:
 
 def _group(conn: sqlite3.Connection, column: str, tenant_id: str) -> dict[str, int]:
     rows = conn.execute(
-        f"SELECT {column} AS k, COUNT(*) AS n FROM repositories WHERE tenant_id = ? GROUP BY {column}",
+        f"SELECT {column} AS k, COUNT(*) AS n FROM repositories WHERE tenant_id = ? AND missing_since IS NULL GROUP BY {column}",
         (tenant_id,),
     ).fetchall()
     return {str(r["k"]): int(r["n"]) for r in rows}
@@ -41,7 +41,7 @@ def portfolio_summary(core: GovernanceCore) -> dict[str, Any]:
     lifecycle_counts = _group(conn, "lifecycle", tenant)
     category_counts = _group(conn, "category", tenant)
 
-    repositories = _count(conn, "SELECT COUNT(*) FROM repositories WHERE tenant_id = ?", (tenant,))
+    repositories = _count(conn, "SELECT COUNT(*) FROM repositories WHERE tenant_id = ? AND missing_since IS NULL", (tenant,))
 
     # A repository counts as "unknown origin" both when Phase 2 has not run at all
     # and when it ran and honestly concluded UNKNOWN.
@@ -50,7 +50,7 @@ def portfolio_summary(core: GovernanceCore) -> dict[str, Any]:
         """
         SELECT COUNT(*) FROM repositories r
         LEFT JOIN origin_profiles o ON o.id = r.origin_profile_id
-        WHERE r.tenant_id = ? AND (o.id IS NULL OR o.origin_type = 'UNKNOWN')
+        WHERE r.tenant_id = ? AND r.missing_since IS NULL AND (o.id IS NULL OR o.origin_type = 'UNKNOWN')
         """,
         (tenant,),
     )
@@ -60,13 +60,13 @@ def portfolio_summary(core: GovernanceCore) -> dict[str, Any]:
         f"""
         SELECT COUNT(*) FROM repositories r
         JOIN license_profiles l ON l.repository_id = r.id
-        WHERE r.tenant_id = ? AND l.compatibility_status IN ({placeholders})
+        WHERE r.tenant_id = ? AND r.missing_since IS NULL AND l.compatibility_status IN ({placeholders})
         """,
         (tenant, *LICENSE_REVIEW_STATUSES),
     )
     unclassified = _count(
         conn,
-        "SELECT COUNT(*) FROM repositories WHERE tenant_id = ? "
+        "SELECT COUNT(*) FROM repositories WHERE tenant_id = ? AND missing_since IS NULL "
         "AND (category = 'UNKNOWN' OR lifecycle = 'UNKNOWN')",
         (tenant,),
     )
@@ -90,19 +90,24 @@ def portfolio_summary(core: GovernanceCore) -> dict[str, Any]:
         "maintenance": lifecycle_counts.get(str(Lifecycle.MAINTENANCE), 0),
         "archived": lifecycle_counts.get(str(Lifecycle.ARCHIVED), 0),
         "forks": _count(
-            conn, "SELECT COUNT(*) FROM repositories WHERE tenant_id = ? AND is_fork = 1", (tenant,)
+            conn, "SELECT COUNT(*) FROM repositories WHERE tenant_id = ? AND missing_since IS NULL AND is_fork = 1", (tenant,)
         ),
         "mirrors": category_counts.get(str(Category.MIRROR), 0),
         "unknown_origin": unknown_origin,
         "license_review_required": license_review_required,
         "unclassified": unclassified,
+        "missing": _count(
+            conn,
+            "SELECT COUNT(*) FROM repositories WHERE tenant_id = ? AND missing_since IS NOT NULL",
+            (tenant,),
+        ),
         # Supporting detail — the raw distributions the headline numbers came from.
         "lifecycle_counts": lifecycle_counts,
         "category_counts": category_counts,
         "visibility_counts": _group(conn, "visibility", tenant),
         "archived_flag": _count(
             conn,
-            "SELECT COUNT(*) FROM repositories WHERE tenant_id = ? AND is_archived = 1",
+            "SELECT COUNT(*) FROM repositories WHERE tenant_id = ? AND missing_since IS NULL AND is_archived = 1",
             (tenant,),
         ),
         "snapshots": _count(
@@ -119,7 +124,7 @@ def _language_totals(conn: sqlite3.Connection, tenant_id: str) -> dict[str, int]
     """Repository counts per language, primary language first, then anything seen."""
     totals: dict[str, int] = {}
     for row in conn.execute(
-        "SELECT languages FROM repositories WHERE tenant_id = ?", (tenant_id,)
+        "SELECT languages FROM repositories WHERE tenant_id = ? AND missing_since IS NULL", (tenant_id,)
     ):
         for name in loads(row["languages"], {}) or {}:
             totals[name] = totals.get(name, 0) + 1

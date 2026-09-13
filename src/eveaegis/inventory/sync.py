@@ -38,7 +38,7 @@ from ..audit import content_hash
 from ..core import GovernanceCore
 from ..credentials import TokenScope
 from ..db import dumps, iso, loads, upsert
-from ..githubapi import GitHubClient, NotFound
+from ..githubapi import GitHubClient, GitHubError, NotFound
 from ..models import GitHubInstallation, RepositoryAsset
 from ..taxonomy import (
     AgentAccess,
@@ -75,6 +75,8 @@ class InventoryResult(BaseModel):
     updated: int = 0
     snapshots: int = 0
     errors: list[str] = []
+    #: Repositories a complete sweep no longer saw. Empty after a partial sweep.
+    missing: list[str] = []
     duration_seconds: float = 0.0
 
 
@@ -248,6 +250,12 @@ class InventorySync:
                 result.updated += outcome["updated"]
                 result.snapshots += outcome["snapshots"]
 
+            # Only a complete, error-free sweep is evidence of absence. A partial
+            # sweep (limit set, or a listing that failed) says nothing about the
+            # repositories it never reached, so it must not mark anything missing.
+            if limit is None and not result.errors:
+                result.missing = self._reconcile_presence(seen)
+
             result.duration_seconds = round(time.monotonic() - started, 3)
             self.core.ledger.record(
                 "inventory_sync_completed",
@@ -309,7 +317,7 @@ class InventorySync:
         ``only_unclassified`` is the §19.1 "Unclassified" bucket: anything whose
         category or lifecycle is still ``UNKNOWN``, i.e. still waiting for Phase 3.
         """
-        sql = "SELECT * FROM repositories WHERE tenant_id = ?"
+        sql = "SELECT * FROM repositories WHERE tenant_id = ? AND missing_since IS NULL"
         if only_unclassified:
             sql += " AND (category = 'UNKNOWN' OR lifecycle = 'UNKNOWN')"
         sql += " ORDER BY pushed_at DESC NULLS LAST, full_name ASC"
@@ -411,6 +419,49 @@ class InventorySync:
         # Cache so the repository sweep does not pay for the same listing twice.
         self._installation_repo_cache = repos
         return list(seen.values())
+
+    def _reconcile_presence(self, seen: set[str]) -> list[str]:
+        """Mark rows the sweep did not see, and clear ones that came back.
+
+        Rows are never deleted: a repository's governance history is the reason
+        the catalog exists, and GitHub itself keeps deleted repositories restorable
+        for 90 days, so absence is a state, not an erasure.
+        """
+        conn = self.core.conn
+        now = datetime.now(timezone.utc).isoformat()
+        seen_lower = {name.lower() for name in seen}
+        newly_missing: list[str] = []
+        for row in conn.execute(
+            "SELECT full_name, missing_since FROM repositories WHERE tenant_id = ?",
+            (self.core.tenant_id,),
+        ).fetchall():
+            present = row["full_name"].lower() in seen_lower
+            if not present and row["missing_since"] is None:
+                conn.execute(
+                    "UPDATE repositories SET missing_since = ? WHERE tenant_id = ? AND full_name = ?",
+                    (now, self.core.tenant_id, row["full_name"]),
+                )
+                newly_missing.append(row["full_name"])
+            elif present and row["missing_since"] is not None:
+                conn.execute(
+                    "UPDATE repositories SET missing_since = NULL WHERE tenant_id = ? AND full_name = ?",
+                    (self.core.tenant_id, row["full_name"]),
+                )
+                self.core.ledger.record(
+                    "inventory_repository_reappeared",
+                    tenant=self.core.tenant_id,
+                    targets=[row["full_name"]],
+                    detail={"was_missing_since": row["missing_since"]},
+                )
+        if newly_missing:
+            self.core.ledger.record(
+                "inventory_repositories_missing",
+                tenant=self.core.tenant_id,
+                targets=newly_missing,
+                detail={"count": len(newly_missing), "note": "rows retained; governance history preserved"},
+            )
+        conn.commit()
+        return newly_missing
 
     def _installation_for(self, login: str) -> GitHubInstallation | None:
         row = self.core.conn.execute(
@@ -552,6 +603,13 @@ class InventorySync:
             entries = gh.tree(payload["full_name"], ref, recursive=True)
         except NotFound:
             return None
+        except GitHubError as exc:
+            # 409 "Git Repository is empty" and similar: the repository exists and
+            # must still be inventoried — it simply has no tree to snapshot. Only a
+            # tree fetch failed here, not the repository.
+            if exc.status in (409, 422):
+                return None
+            raise
         if not entries:
             return None
         return {

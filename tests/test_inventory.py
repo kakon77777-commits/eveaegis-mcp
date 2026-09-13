@@ -867,3 +867,89 @@ class TestInstallationModeDiscovery:
         )
         assert result.repositories == 0
         assert any("App suspended" in e for e in result.errors)
+
+
+# --------------------------------------------------------------------------
+# presence: a repository that disappears from GitHub
+# --------------------------------------------------------------------------
+
+class TestPresenceReconciliation:
+    """Rows are never deleted; absence is a state. Only a complete sweep can assert it."""
+
+    @staticmethod
+    def _sweep(sync: InventorySync, **kw: Any):
+        return sync.sync_repositories(
+            include_readme=False, include_languages=False, include_tree=False, **kw
+        )
+
+    def test_vanished_repository_is_marked_not_deleted(self, core: GovernanceCore) -> None:
+        client = bind(core, FakeGitHubClient(user_repos=[repo_payload(), repo_payload(repo_id=201, name="beta")]))
+        sync = InventorySync(core)
+        self._sweep(sync)
+
+        client._user_repos = [repo_payload()]  # beta was deleted on GitHub
+        result = self._sweep(sync)
+
+        assert result.missing == ["octo/beta"]
+        row = core.conn.execute("SELECT missing_since FROM repositories WHERE full_name='octo/beta'").fetchone()
+        assert row is not None, "the row must survive"
+        assert row["missing_since"] is not None
+        assert core.conn.execute("SELECT COUNT(*) n FROM repositories").fetchone()["n"] == 2
+        assert any(a.action == "inventory_repositories_missing" for a in core.ledger.recent(5))
+
+    def test_present_views_exclude_missing_rows(self, core: GovernanceCore) -> None:
+        client = bind(core, FakeGitHubClient(user_repos=[repo_payload(), repo_payload(repo_id=201, name="beta")]))
+        sync = InventorySync(core)
+        self._sweep(sync)
+        client._user_repos = [repo_payload()]
+        self._sweep(sync)
+
+        assert {r.full_name for r in sync.list_repositories()} == {"octo/alpha"}
+        summary = portfolio_summary(core)
+        assert summary["repositories"] == 1
+        assert summary["missing"] == 1
+
+    def test_reappearance_clears_the_mark(self, core: GovernanceCore) -> None:
+        """GitHub restores deleted repositories within 90 days; so do we."""
+        client = bind(core, FakeGitHubClient(user_repos=[repo_payload(), repo_payload(repo_id=201, name="beta")]))
+        sync = InventorySync(core)
+        self._sweep(sync)
+        client._user_repos = [repo_payload()]
+        self._sweep(sync)
+        client._user_repos = [repo_payload(), repo_payload(repo_id=201, name="beta")]
+        result = self._sweep(sync)
+
+        assert result.missing == []
+        row = core.conn.execute("SELECT missing_since FROM repositories WHERE full_name='octo/beta'").fetchone()
+        assert row["missing_since"] is None
+        assert any(a.action == "inventory_repository_reappeared" for a in core.ledger.recent(5))
+
+    def test_partial_sweep_never_asserts_absence(self, core: GovernanceCore) -> None:
+        """`limit` reaches only some repositories; the rest are unobserved, not gone."""
+        client = bind(core, FakeGitHubClient(user_repos=[repo_payload(), repo_payload(repo_id=201, name="beta")]))
+        sync = InventorySync(core)
+        self._sweep(sync)
+
+        result = self._sweep(sync, limit=1)
+        assert result.missing == []
+        assert core.conn.execute("SELECT COUNT(*) n FROM repositories WHERE missing_since IS NOT NULL").fetchone()["n"] == 0
+
+    def test_a_failed_listing_never_asserts_absence(self, core: GovernanceCore) -> None:
+        """An org whose listing errored contributed nothing; its repos are not missing."""
+        client = bind(
+            core,
+            FakeGitHubClient(
+                orgs=[{"id": 300, "login": "evemisslab"}],
+                user_repos=[repo_payload()],
+                org_repos={"evemisslab": [repo_payload(owner_id=300, owner_login="evemisslab", repo_id=301, name="corp")]},
+            ),
+        )
+        sync = InventorySync(core)
+        self._sweep(sync)
+        assert core.conn.execute("SELECT COUNT(*) n FROM repositories").fetchone()["n"] == 2
+
+        client._fail_on = {"org_repos:evemisslab": RuntimeError("403")}
+        result = self._sweep(sync)
+        assert result.errors  # the failure is reported
+        assert result.missing == []  # and nothing is declared gone
+        assert core.conn.execute("SELECT COUNT(*) n FROM repositories WHERE missing_since IS NOT NULL").fetchone()["n"] == 0

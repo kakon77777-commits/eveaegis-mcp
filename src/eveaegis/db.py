@@ -19,7 +19,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Iterable
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 
 MIGRATIONS: dict[int, str] = {
     1: """
@@ -306,6 +306,13 @@ MIGRATIONS: dict[int, str] = {
     -- in the id scheme, which a second writer could have violated silently.
     CREATE UNIQUE INDEX IF NOT EXISTS idx_origin_one_per_repo
         ON origin_profiles(repository_id);
+    """,
+    4: """
+    -- A repository that a sweep no longer sees. Rows are never deleted: the
+    -- governance history is the point of keeping them. Cleared if it reappears
+    -- (a transfer back, an un-delete within GitHub's 90-day window).
+    ALTER TABLE repositories ADD COLUMN missing_since TEXT;
+    CREATE INDEX IF NOT EXISTS idx_repositories_missing ON repositories(missing_since);
     """,
 }
 
