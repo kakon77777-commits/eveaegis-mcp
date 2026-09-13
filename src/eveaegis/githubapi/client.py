@@ -63,6 +63,17 @@ def _unwrap_collection(payload: dict[str, Any], path: str) -> list[Any]:
     )
 
 
+def _error_message(resp: httpx.Response) -> str:
+    """GitHub error bodies are usually JSON with `message`; never assume it."""
+    try:
+        payload = resp.json()
+        if isinstance(payload, dict) and payload.get("message"):
+            return str(payload["message"])
+    except ValueError:
+        pass
+    return (resp.text or "").strip()[:200] or f"HTTP {resp.status_code}"
+
+
 class GitHubError(RuntimeError):
     def __init__(self, status: int, message: str, path: str) -> None:
         super().__init__(f"GitHub {status} on {path}: {message}")
@@ -101,9 +112,9 @@ class GitHubClient:
     # -- lifecycle --------------------------------------------------------
 
     def close(self) -> None:
-        if self._grant:
-            self._grant.revoke()
-            self._grant = None
+        # The broker owns the grant's lifetime (it may be serving other clients);
+        # this client only drops its reference. Expiry, not close, ends a grant.
+        self._grant = None
         self._client.close()
 
     def __enter__(self) -> "GitHubClient":
@@ -194,7 +205,7 @@ class GitHubClient:
             self.request_count += 1
 
             if resp.status_code == 404:
-                raise NotFound(404, resp.json().get("message", "not found"), path)
+                raise NotFound(404, _error_message(resp), path)
             if resp.status_code in (403, 429) and "rate limit" in resp.text.lower():
                 reset = int(resp.headers.get("x-ratelimit-reset", time.time() + 60))
                 time.sleep(min(max(reset - int(time.time()), 1), 120))
@@ -204,16 +215,17 @@ class GitHubClient:
                 time.sleep(1.5 * (attempt + 1))
                 continue
             if resp.status_code >= 400:
-                try:
-                    message = resp.json().get("message", resp.text[:200])
-                except ValueError:
-                    message = resp.text[:200]
-                raise GitHubError(resp.status_code, message, path)
+                raise GitHubError(resp.status_code, _error_message(resp), path)
             if raw:
                 return resp
             if not resp.content:
                 return None
-            return resp.json()
+            try:
+                return resp.json()
+            except ValueError as exc:
+                # A 2xx with a non-JSON body (empty, HTML from a proxy, truncated).
+                # Surface it as an API error rather than a decoder traceback.
+                raise GitHubError(resp.status_code, f"non-JSON body: {resp.text[:120]!r}", path) from exc
 
         raise GitHubError(0, f"exhausted retries ({last_error})", path)
 

@@ -104,7 +104,7 @@ class Classifier:
 
     def classify_all(self, *, limit: int | None = None) -> list[ClassificationResult]:
         """Classify every inventoried repository in the tenant. Does not persist."""
-        sql = "SELECT * FROM repositories WHERE tenant_id = ? ORDER BY full_name"
+        sql = "SELECT * FROM repositories WHERE tenant_id = ? AND missing_since IS NULL ORDER BY full_name"
         if limit is not None:
             sql += f" LIMIT {int(limit)}"
         rows = self.conn.execute(sql, (self.core.tenant_id,)).fetchall()
@@ -210,7 +210,7 @@ class Classifier:
         max_stars = int(self.profile.threshold("archive_candidate_max_stars", 3))
         out: list[dict] = []
         for row in self.conn.execute(
-            "SELECT * FROM repositories WHERE tenant_id = ? ORDER BY full_name",
+            "SELECT * FROM repositories WHERE tenant_id = ? AND missing_since IS NULL ORDER BY full_name",
             (self.core.tenant_id,),
         ).fetchall():
             sig = collect_signals(self.conn, row)
@@ -258,7 +258,7 @@ class Classifier:
         overlap_threshold = self.profile.threshold("superseded_name_overlap", 0.60)
 
         rows = self.conn.execute(
-            "SELECT * FROM repositories WHERE tenant_id = ? ORDER BY full_name",
+            "SELECT * FROM repositories WHERE tenant_id = ? AND missing_since IS NULL ORDER BY full_name",
             (self.core.tenant_id,),
         ).fetchall()
         sigs = [collect_signals(self.conn, row) for row in rows]

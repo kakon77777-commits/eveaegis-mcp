@@ -1,0 +1,119 @@
+# Hints for proposing an asset class (A/B/C/D) per the 2026-09-03 Migration
+# Strategy. These produce *proposals* with a confidence — never declarations.
+# Tune here, not in code. Names are matched case-insensitively against the
+# repository name (owner stripped); domains against homepage + description.
+
+# Any of these in the homepage/description/README is a company signal.
+company_domains:
+  - evemisslab.com
+  - evemisstechnology.com
+  - evemiss.com
+  - commoninstant.org
+  - efficientnewlanguage.org
+  - eveglypheditor.com
+  - agiright.org
+  - unboundedaxiom.org
+  - thisoneisneok.com
+
+company_phrases:
+  - EveMissLab
+  - EveMiss Technology
+  - 一言諾
+
+# Class A — Company Core: products, core infrastructure, company sites, main OSS.
+core_names:
+  - eveaegis-mcp
+  - ctcl
+  - ctcl-app
+  - ai-board
+  - board-host-ai
+  - storyforge
+  - eveglyph-editor
+  - eveglyph-editor-internal
+  - eveglyph-website
+  - evemiss-com
+  - evemiss-technology
+  - evemisslab-com
+  - efficientnewlanguage
+  - efficientnewlanguage-site
+  - eml-phosphor
+  - phosphor-mccp
+  - agiright-org
+  - continuous-discovery-beacon
+  - evesite-forge
+  - anla
+  - webcode-sonification-engine
+  - wse-site
+
+# Class B — Company Research (case-by-case per the strategy).
+research_prefixes:
+  - mmr
+  - mmlc
+  - mmpf
+  - mmrf
+  - mlf
+  - amral
+  - felra
+  - mssp
+  - compilableworld
+research_names:
+  - unbounded-axiom
+  - matrix-ledger-format
+  - MCDM
+  - SSSP
+  - APR
+  - MRMIC_NVCL
+  - ULCS
+  - utf-8x
+  - dieec
+  - ms3e
+  - drvs
+  - Veritaxa
+  - evemiss-fpl
+  - FARHP
+  - open-chinese-math-encyclopedia
+  - repo-perspector
+  - ai-web-research
+  - universal-directory
+  - amep
+  - arcp-mvp
+  - LSPR
+  - Bugology
+  - evedirector-web-runtime
+
+# Class C — Personal / Experimental.
+personal_names:
+  - thisoneisneok
+  - ai-player-agent
+  - from-jianghu-governance
+  - CompilableWorld-Evennia-Prototype
+  - canvas-md-exporter-for-chatgpt
+  - matrix-select
+  - tandem-browser
+
+# Project families: prefix -> family id. First match wins; longest prefix first.
+families:
+  eveglyph: eveglyph
+  efficientnewlanguage: eml
+  eml-phosphor: phosphor
+  phosphor: phosphor
+  ctcl: ctcl
+  amral: amral
+  felra: felra
+  evemiss: evemiss-sites
+  evemisslab: evemiss-sites
+  mmr: 3m-series
+  mmlc: 3m-series
+  mmpf: 3m-series
+  mmrf: 3m-series
+  mlf: 3m-series
+  matrix-ledger-format: 3m-series
+  mssp: mssp
+  compilableworld: mssp
+  wse: wse
+  webcode-sonification: wse
+  ai-board: ai-board
+  board-host: ai-board
+  unbounded-axiom: logic-matrix
+  storyforge: storyforge
+  agiright: agiright

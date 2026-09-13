@@ -127,8 +127,13 @@ class CredentialBroker(abc.ABC):
     #: rather than being sniffed downstream.
     identity_mode: str = "user"
 
+    #: A cached grant is reused only while it still has at least this long to live,
+    #: so a caller never receives one that expires under its first request.
+    reuse_floor_seconds: int = 30
+
     def __init__(self, *, max_lifetime_seconds: int = 600) -> None:
         self.max_lifetime_seconds = max_lifetime_seconds
+        self._live: dict[tuple[TokenScope, tuple[str, ...]], Grant] = {}
 
     @abc.abstractmethod
     def _mint(
@@ -155,8 +160,17 @@ class CredentialBroker(abc.ABC):
             )
         if not reason:
             raise CredentialError("every grant must carry a reason for the audit ledger")
+        # Reuse a live grant for the same scope and repository set. Minting per
+        # call made a 108-repository sweep request 108 installation tokens in a
+        # row, which GitHub throttles; the lifetime cap (axiom 5) is unchanged —
+        # the same grant simply serves more than one request before it expires.
+        key = (scope, tuple(repositories))
+        live = self._live.get(key)
+        if live is not None and not live.expired and live.seconds_remaining > self.reuse_floor_seconds:
+            return live
         lifetime = min(lifetime_seconds, self.max_lifetime_seconds)
         grant = self._mint(scope, lifetime, repositories, reason)
+        self._live[key] = grant
         # Axiom 5: higher risk must not be able to buy a longer life.
         cap = datetime.now(timezone.utc) + timedelta(seconds=lifetime)
         if grant.expires_at > cap:

@@ -108,20 +108,31 @@ class GitHubAppBroker(CredentialBroker):
             # Installation tokens take bare repo names, not owner/name.
             body["repositories"] = [r.split("/", 1)[-1] for r in repositories]
 
-        resp = httpx.post(
-            f"{self.api_base}/app/installations/{installation_id}/access_tokens",
-            headers={
-                "Authorization": f"Bearer {self._app_jwt(app_id, key_path)}",
-                "Accept": "application/vnd.github+json",
-                "X-GitHub-Api-Version": "2022-11-28",
-            },
-            json=body,
-            timeout=20.0,
-        )
+        # The token endpoint answers 502 now and then. A transient gateway error is
+        # not a reason to abort a sweep, so retry briefly before giving up.
+        resp = None
+        for attempt in range(5):
+            resp = httpx.post(
+                f"{self.api_base}/app/installations/{installation_id}/access_tokens",
+                headers={
+                    "Authorization": f"Bearer {self._app_jwt(app_id, key_path)}",
+                    "Accept": "application/vnd.github+json",
+                    "X-GitHub-Api-Version": "2022-11-28",
+                },
+                json=body,
+                timeout=20.0,
+            )
+            if resp.status_code < 500:
+                break
+            time.sleep(min(3.0 * (2 ** attempt), 30.0))
+        assert resp is not None
         if resp.status_code >= 400:
+            try:
+                detail = str(resp.json().get("message", ""))
+            except ValueError:
+                detail = (resp.text or "").strip()[:160]
             raise CredentialError(
-                f"installation token request failed ({resp.status_code}): "
-                f"{resp.json().get('message', '')}"
+                f"installation token request failed ({resp.status_code}): {detail}"
             )
         data = resp.json()
         github_expiry = datetime.fromisoformat(data["expires_at"].replace("Z", "+00:00"))

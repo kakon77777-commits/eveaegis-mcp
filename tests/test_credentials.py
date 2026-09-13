@@ -130,3 +130,34 @@ class TestBackendCeilings:
         ok, message = broker.health_check()
         assert not ok
         assert "not configured" in message
+
+
+class TestGrantReuse:
+    def test_live_grant_is_reused_for_same_scope(self) -> None:
+        """A sweep must not mint one token per repository."""
+        broker = NoisyBroker(max_lifetime_seconds=300)
+        a = broker.mint(TokenScope.READ_METADATA, reason="sweep")
+        b = broker.mint(TokenScope.READ_METADATA, reason="sweep")
+        assert a is b
+
+    def test_different_scope_or_repositories_get_their_own_grant(self) -> None:
+        broker = NoisyBroker(max_lifetime_seconds=300)
+        a = broker.mint(TokenScope.READ_METADATA, reason="x")
+        b = broker.mint(TokenScope.READ_CONTENT, reason="x")
+        c = broker.mint(TokenScope.READ_METADATA, repositories=("o/r",), reason="x")
+        assert len({id(a), id(b), id(c)}) == 3
+
+    def test_expired_or_nearly_expired_grant_is_replaced(self) -> None:
+        broker = NoisyBroker(max_lifetime_seconds=300)
+        a = broker.mint(TokenScope.READ_METADATA, reason="x")
+        a.expires_at = datetime.now(timezone.utc) + timedelta(seconds=5)  # under the reuse floor
+        b = broker.mint(TokenScope.READ_METADATA, reason="x")
+        assert b is not a
+        assert b.seconds_remaining > 100
+
+    def test_lifetime_cap_still_applies_to_reused_grants(self) -> None:
+        """Axiom 5 is untouched: reuse never extends a grant's life."""
+        broker = NoisyBroker(max_lifetime_seconds=120)
+        a = broker.mint(TokenScope.READ_METADATA, lifetime_seconds=999, reason="x")
+        b = broker.mint(TokenScope.READ_METADATA, lifetime_seconds=999, reason="x")
+        assert b is a and a.seconds_remaining <= 120

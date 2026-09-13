@@ -30,8 +30,10 @@ console = Console()
 
 review_app = typer.Typer(help="Human review of provenance verdicts (sec. 19.3).", no_args_is_help=True)
 audit_app = typer.Typer(help="Audit ledger inspection (sec. 18).", no_args_is_help=True)
+registry_app = typer.Typer(help="Canonical Repository Registry (Recovery Index sec. 5).", no_args_is_help=True)
 app.add_typer(review_app, name="review")
 app.add_typer(audit_app, name="audit")
+app.add_typer(registry_app, name="registry")
 
 
 def _core(config: Optional[str] = None) -> GovernanceCore:
@@ -189,6 +191,7 @@ def origin(
     repository: Optional[str] = typer.Argument(None, help="owner/name; omit with --all"),
     config: Optional[str] = typer.Option(None, "--config", "-c"),
     all_repos: bool = typer.Option(False, "--all", help="Analyze every governed repository."),
+    missing: bool = typer.Option(False, "--missing", help="Only repositories with no origin profile yet."),
     deep: bool = typer.Option(False, help="Clone a bare mirror for commit/blob evidence."),
     limit: Optional[int] = typer.Option(None),
     report: bool = typer.Option(False, help="Print the full evidence report."),
@@ -196,13 +199,27 @@ def origin(
     """Determine where repositories came from (Phase 2)."""
     from .provenance import ProvenanceEngine
 
-    if not repository and not all_repos:
-        raise typer.BadParameter("give a repository or --all")
+    if not repository and not all_repos and not missing:
+        raise typer.BadParameter("give a repository, --all, or --missing")
 
     core = _core(config)
     try:
         engine = ProvenanceEngine(core)
-        if all_repos:
+        if missing:
+            todo = [
+                r["full_name"]
+                for r in core.conn.execute(
+                    "SELECT r.full_name FROM repositories r LEFT JOIN origin_profiles o ON o.repository_id = r.id "
+                    "WHERE r.tenant_id = ? AND r.missing_since IS NULL AND o.id IS NULL ORDER BY r.full_name",
+                    (core.tenant_id,),
+                )
+            ]
+            profiles = []
+            for name in todo[: limit or None]:
+                p = engine.analyze(name, deep=deep)
+                engine.save(p)
+                profiles.append(p)
+        elif all_repos:
             profiles = engine.analyze_all(deep=deep, limit=limit)
         else:
             profile = engine.analyze(repository, deep=deep)  # type: ignore[arg-type]
@@ -391,6 +408,108 @@ def policy(
         console.print_json(json.dumps(decision_payload(decision), ensure_ascii=False))
         if explain:
             console.print(guard.policy.explain(request))
+    finally:
+        core.close()
+
+
+# --------------------------------------------------------------------------
+# registry (Recovery Index sec. 5 / Migration Strategy sec. 6)
+# --------------------------------------------------------------------------
+
+@registry_app.command("propose")
+def registry_propose(config: Optional[str] = typer.Option(None, "--config", "-c")) -> None:
+    """Propose A/B/C/D class + project family for every repository. Proposals only."""
+    from .registry import propose_classes
+
+    core = _core(config)
+    try:
+        counts = propose_classes(core)
+        console.print("proposed classes: " + ", ".join(f"{k}={v}" for k, v in sorted(counts.items())))
+        console.print("[dim]nothing was declared; edit the exported CSV or use `registry declare`[/dim]")
+    finally:
+        core.close()
+
+
+@registry_app.command("export")
+def registry_export(
+    path: str = typer.Argument("workspace/registry.csv"),
+    config: Optional[str] = typer.Option(None, "--config", "-c"),
+) -> None:
+    """Write the merged registry as CSV (template columns + machine proposals)."""
+    from pathlib import Path
+
+    from .registry import export_csv
+
+    core = _core(config)
+    try:
+        n = export_csv(core, core.cfg.resolve(path) if not Path(path).is_absolute() else Path(path))
+        console.print(f"[green]exported[/green] {n} repositories -> {path}")
+    finally:
+        core.close()
+
+
+@registry_app.command("import")
+def registry_import(
+    path: str = typer.Argument(..., help="An edited registry CSV."),
+    declared_by: str = typer.Option("human:owner", help="Who is declaring. Never an agent."),
+    config: Optional[str] = typer.Option(None, "--config", "-c"),
+) -> None:
+    """Apply the declaration columns of an edited CSV. Fact columns are ignored."""
+    from pathlib import Path
+
+    from .registry import import_csv
+
+    if declared_by.startswith("agent:"):
+        raise typer.BadParameter("declarations are human-only; an agent may only propose")
+    core = _core(config)
+    try:
+        r = import_csv(core, Path(path), declared_by=declared_by)
+        console.print(f"[green]applied[/green] {len(r['applied'])}  unchanged {r['unchanged']}  errors {len(r['errors'])}")
+        for e in r["errors"][:20]:
+            console.print(f"  [yellow]![/yellow] {e}")
+    finally:
+        core.close()
+
+
+@registry_app.command("declare")
+def registry_declare(
+    repository: str = typer.Argument(..., help="owner/name"),
+    asset_class: Optional[str] = typer.Option(None, "--class", help="A | B | C | D"),
+    target_owner: Optional[str] = typer.Option(None, "--target-owner"),
+    canonical: Optional[str] = typer.Option(None, help="true | false | undeclared"),
+    product: Optional[str] = typer.Option(None),
+    family: Optional[str] = typer.Option(None, "--family"),
+    superseded_by: Optional[str] = typer.Option(None, "--superseded-by"),
+    notes: Optional[str] = typer.Option(None),
+    declared_by: str = typer.Option("human:owner"),
+    config: Optional[str] = typer.Option(None, "--config", "-c"),
+) -> None:
+    """Declare ownership facts for one repository. Human-only, audited."""
+    from .registry import Declaration, RegistryStore
+
+    if declared_by.startswith("agent:"):
+        raise typer.BadParameter("declarations are human-only; an agent may only propose")
+    core = _core(config)
+    try:
+        row = core.conn.execute(
+            "SELECT id FROM repositories WHERE tenant_id = ? AND full_name = ?",
+            (core.tenant_id, repository),
+        ).fetchone()
+        if not row:
+            console.print(f"[red]{repository} is not in the inventory[/red]")
+            raise typer.Exit(code=1)
+        store = RegistryStore(core)
+        current = store.declaration(row["id"]) or Declaration(repository_id=row["id"])
+        updates = {k: v for k, v in {
+            "asset_class": asset_class, "target_owner": target_owner, "canonical": canonical,
+            "product": product, "project_family": family, "superseded_by": superseded_by, "notes": notes,
+        }.items() if v is not None}
+        if not updates:
+            raise typer.BadParameter("nothing to declare")
+        decl = current.model_copy(update={**updates, "declared_by": declared_by})
+        decl = Declaration(**decl.model_dump())  # re-run validators
+        store.declare(decl, initiated_by=declared_by)
+        console.print(f"[green]{repository}[/green] " + ", ".join(f"{k}={v}" for k, v in updates.items()))
     finally:
         core.close()
 

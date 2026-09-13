@@ -43,7 +43,7 @@ from typing import Any, Mapping, Sequence
 
 from ..config import AnalysisConfig
 from ..core import GovernanceCore
-from ..credentials import TokenScope
+from ..credentials import CredentialError, TokenScope
 from ..db import dumps, loads, upsert
 from ..githubapi import GitHubClient
 from ..githubapi.client import GitHubError, NotFound
@@ -322,9 +322,22 @@ class ProvenanceEngine:
     def analyze_all(self, *, deep: bool = False, limit: int | None = None) -> list[OriginProfile]:
         """Analyze the whole inventory, or the live account when it is not synced yet."""
         profiles: list[OriginProfile] = []
+        consecutive_credential_failures = 0
         for full_name in self._inventory(limit=limit):
             try:
                 profile = self.analyze(full_name, deep=deep)
+                consecutive_credential_failures = 0
+            except CredentialError as exc:
+                # A transient token-endpoint failure costs one repository; a dead
+                # credential would cost all of them identically, so stop early.
+                consecutive_credential_failures += 1
+                self.core.ledger.record(
+                    "provenance.analyze", actor="agent:local", tenant=self.core.tenant_id,
+                    targets=[full_name], result="FAILED", detail={"error": str(exc)[:300]},
+                )
+                if consecutive_credential_failures >= 3:
+                    raise
+                continue
             except (GitHubError, gitlocal.GitError) as exc:
                 # One unreachable repository must not abort a portfolio sweep.
                 self.core.ledger.record(
@@ -505,7 +518,8 @@ class ProvenanceEngine:
 
     def _inventory(self, *, limit: int | None = None) -> list[str]:
         rows = self.core.conn.execute(
-            "SELECT full_name FROM repositories WHERE tenant_id = ? ORDER BY full_name",
+            "SELECT full_name FROM repositories WHERE tenant_id = ? AND missing_since IS NULL "
+            "ORDER BY full_name",
             (self.core.tenant_id,),
         ).fetchall()
         if rows:

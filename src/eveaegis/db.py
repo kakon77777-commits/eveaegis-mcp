@@ -19,7 +19,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Iterable
 
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5
 
 MIGRATIONS: dict[int, str] = {
     1: """
@@ -313,6 +313,47 @@ MIGRATIONS: dict[int, str] = {
     -- (a transfer back, an un-delete within GitHub's 90-day window).
     ALTER TABLE repositories ADD COLUMN missing_since TEXT;
     CREATE INDEX IF NOT EXISTS idx_repositories_missing ON repositories(missing_since);
+    """,
+    5: """
+    -- Canonical Repository Registry (Recovery Index 2026-09-13 s5): the governance
+    -- registry and the company-migration registry merged into ONE, so two tables
+    -- cannot drift apart. Facts stay in `repositories`; what a human *declares*
+    -- about ownership lives here, keyed 1:1. Nothing in this table is inferred.
+    CREATE TABLE IF NOT EXISTS registry_declarations (
+        repository_id   TEXT PRIMARY KEY REFERENCES repositories(id),
+        display_name    TEXT,
+        asset_class     TEXT,                     -- A | B | C | D  (Migration Strategy s1)
+        target_owner    TEXT,
+        canonical       TEXT NOT NULL DEFAULT 'undeclared',  -- true | false | undeclared
+        product         TEXT,
+        transfer_status TEXT NOT NULL DEFAULT 'pending',     -- pending | transferred | archived | stays
+        project_family  TEXT,
+        superseded_by   TEXT,
+        dependencies    TEXT NOT NULL DEFAULT '[]',
+        capabilities    TEXT NOT NULL DEFAULT '[]',
+        website         TEXT,
+        mcp_endpoint    TEXT,
+        mcp_status      TEXT,
+        maintainer      TEXT,
+        notes           TEXT,
+        declared_by     TEXT NOT NULL,
+        declared_at     TEXT NOT NULL
+    );
+
+    -- Machine proposals for registry fields. Append-only: an agent may propose a
+    -- class, never declare one (Machine Proposal != Authoritative State).
+    CREATE TABLE IF NOT EXISTS registry_proposals (
+        id            TEXT PRIMARY KEY,
+        repository_id TEXT NOT NULL REFERENCES repositories(id),
+        field         TEXT NOT NULL,
+        value         TEXT,
+        confidence    REAL NOT NULL,
+        rationale     TEXT NOT NULL,
+        proposed_by   TEXT NOT NULL,
+        proposed_at   TEXT NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS idx_registry_proposals_repo
+        ON registry_proposals(repository_id, field, proposed_at DESC);
     """,
 }
 
