@@ -65,6 +65,7 @@ class Grant:
     reason: str
     account_login: str | None = None
     repositories: tuple[str, ...] = ()
+    installation_id: int | None = None
     _secret: str = field(default="", repr=False)
 
     @property
@@ -133,7 +134,7 @@ class CredentialBroker(abc.ABC):
 
     def __init__(self, *, max_lifetime_seconds: int = 600) -> None:
         self.max_lifetime_seconds = max_lifetime_seconds
-        self._live: dict[tuple[TokenScope, tuple[str, ...]], Grant] = {}
+        self._live: dict[tuple[TokenScope, tuple[str, ...], int | None], Grant] = {}
 
     @abc.abstractmethod
     def _mint(
@@ -142,8 +143,19 @@ class CredentialBroker(abc.ABC):
         lifetime_seconds: int,
         repositories: tuple[str, ...],
         reason: str,
+        installation_id: int | None = None,
     ) -> Grant:
         ...
+
+    def installations(self) -> list[dict[str, object]]:
+        """Accounts this credential can act for, as ``{id, login, type, ...}`` dicts.
+
+        A delegated user token acts as exactly one person, so the list is empty
+        and ``installation_id`` is meaningless. A GitHub App may be installed on
+        several accounts — a founder's personal account *and* the company org —
+        and each installation mints its own tokens.
+        """
+        return []
 
     def mint(
         self,
@@ -152,6 +164,7 @@ class CredentialBroker(abc.ABC):
         lifetime_seconds: int = 300,
         repositories: tuple[str, ...] = (),
         reason: str = "",
+        installation_id: int | None = None,
     ) -> Grant:
         if SCOPE_RANK[scope] > SCOPE_RANK[self.max_scope]:
             raise CredentialError(
@@ -164,12 +177,12 @@ class CredentialBroker(abc.ABC):
         # call made a 108-repository sweep request 108 installation tokens in a
         # row, which GitHub throttles; the lifetime cap (axiom 5) is unchanged —
         # the same grant simply serves more than one request before it expires.
-        key = (scope, tuple(repositories))
+        key = (scope, tuple(repositories), installation_id)
         live = self._live.get(key)
         if live is not None and not live.expired and live.seconds_remaining > self.reuse_floor_seconds:
             return live
         lifetime = min(lifetime_seconds, self.max_lifetime_seconds)
-        grant = self._mint(scope, lifetime, repositories, reason)
+        grant = self._mint(scope, lifetime, repositories, reason, installation_id)
         self._live[key] = grant
         # Axiom 5: higher risk must not be able to buy a longer life.
         cap = datetime.now(timezone.utc) + timedelta(seconds=lifetime)

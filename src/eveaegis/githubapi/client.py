@@ -94,11 +94,15 @@ class GitHubClient:
         *,
         scope: TokenScope = TokenScope.READ_METADATA,
         reason: str = "governance read",
+        installation_id: int | None = None,
     ) -> None:
         self.broker = broker
         self.cfg = cfg or GitHubConfig()
         self.scope = scope
         self.reason = reason
+        #: Which App installation to act as (None = the broker's default). A user
+        #: token ignores it; an App token is minted for exactly this account.
+        self.installation_id = installation_id
         self._grant: Grant | None = None
         self._client = httpx.Client(
             base_url=self.cfg.api_base,
@@ -131,6 +135,7 @@ class GitHubClient:
                 self.scope,
                 lifetime_seconds=self.broker.max_lifetime_seconds,
                 reason=self.reason,
+                installation_id=self.installation_id,
             )
         if repository and not self._grant.covers(repository):
             raise GitHubError(403, f"grant does not cover {repository}", repository)

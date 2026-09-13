@@ -60,13 +60,14 @@ class GitHubAppBroker(CredentialBroker):
 
     # -- configuration ----------------------------------------------------
 
-    def _require_config(self) -> tuple[str, Path, int]:
+    def _require_config(self, installation_id: int | None = None) -> tuple[str, Path, int]:
+        chosen = installation_id or self.installation_id
         missing = [
             n
             for n, v in (
                 ("credentials.app_id", self.app_id),
                 ("credentials.private_key_path", self.private_key_path),
-                ("credentials.installation_id", self.installation_id),
+                ("credentials.installation_id", chosen),
             )
             if not v
         ]
@@ -80,7 +81,7 @@ class GitHubAppBroker(CredentialBroker):
         key_path = Path(self.private_key_path)  # type: ignore[arg-type]
         if not key_path.is_file():
             raise CredentialError(f"private key not found at {key_path}")
-        return str(self.app_id), key_path, int(self.installation_id)  # type: ignore[arg-type]
+        return str(self.app_id), key_path, int(chosen)  # type: ignore[arg-type]
 
     def _app_jwt(self, app_id: str, key_path: Path) -> str:
         try:
@@ -101,8 +102,9 @@ class GitHubAppBroker(CredentialBroker):
         lifetime_seconds: int,
         repositories: tuple[str, ...],
         reason: str,
+        installation_id: int | None = None,
     ) -> Grant:
-        app_id, key_path, installation_id = self._require_config()
+        app_id, key_path, installation_id = self._require_config(installation_id)
         body: dict[str, object] = {"permissions": SCOPE_PERMISSIONS[scope]}
         if repositories:
             # Installation tokens take bare repo names, not owner/name.
@@ -144,8 +146,43 @@ class GitHubAppBroker(CredentialBroker):
             credential_type="github_app_installation_token",
             reason=reason,
             repositories=repositories,
+            installation_id=installation_id,
             _secret=data["token"],
         )
+
+    def _app_headers(self) -> dict[str, str]:
+        if not (self.app_id and self.private_key_path):
+            raise CredentialError("GitHub App backend needs credentials.app_id and private_key_path")
+        key_path = Path(self.private_key_path)
+        if not key_path.is_file():
+            raise CredentialError(f"private key not found at {key_path}")
+        return {
+            "Authorization": f"Bearer {self._app_jwt(str(self.app_id), key_path)}",
+            "Accept": "application/vnd.github+json",
+            "X-GitHub-Api-Version": "2022-11-28",
+        }
+
+    def installations(self) -> list[dict[str, object]]:
+        """Every account the App is installed on, straight from GitHub.
+
+        Discovered rather than configured: the App itself is the authority on
+        where it is installed, and a config list would drift the first time the
+        App is installed somewhere new.
+        """
+        resp = httpx.get(f"{self.api_base}/app/installations", headers=self._app_headers(), timeout=20.0)
+        if resp.status_code != 200:
+            raise CredentialError(f"could not list App installations ({resp.status_code})")
+        return [
+            {
+                "id": int(i["id"]),
+                "login": i["account"]["login"],
+                "account_id": int(i["account"]["id"]),
+                "type": i["account"]["type"],
+                "repository_selection": i.get("repository_selection"),
+                "permissions": i.get("permissions", {}),
+            }
+            for i in resp.json()
+        ]
 
     def health_check(self) -> tuple[bool, str]:
         try:

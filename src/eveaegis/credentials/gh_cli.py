@@ -67,7 +67,9 @@ class GhCliBroker(CredentialBroker):
         lifetime_seconds: int,
         repositories: tuple[str, ...],
         reason: str,
+        installation_id: int | None = None,
     ) -> Grant:
+        # A user token is one person; there is no installation to select.
         token = self._run(["auth", "token", "--hostname", self.hostname])
         if not token:
             raise CredentialError("gh returned an empty token")

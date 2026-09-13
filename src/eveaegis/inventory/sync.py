@@ -278,7 +278,7 @@ class InventorySync:
         endpoint that fills in ``parent``/``source``/``template_repository`` — the
         fields Phase 2 needs to tell a fork from an original.
         """
-        with self.core.client(TokenScope.READ_CONTENT, reason=f"inventory refresh {full_name}") as gh:
+        with self.core.client_for(full_name, TokenScope.READ_CONTENT, reason=f"inventory refresh {full_name}") as gh:
             credential = gh.credential_description
             payload = gh.repo(full_name)
             owner_login = (payload.get("owner") or {}).get("login", "")
@@ -343,15 +343,18 @@ class InventorySync:
         now = datetime.now(timezone.utc).isoformat()
         installations: list[GitHubInstallation] = []
         for payload, kind in accounts:
+            # Under an App each account is its own installation with its own grant
+            # of permissions; the discovery step stamps both onto the payload.
             install = GitHubInstallation(
                 id=account_id(payload),
                 tenant_id=self.core.tenant_id,
                 account_login=payload["login"],
                 account_type=kind,
-                installation_id=self.core.cfg.credentials.installation_id
+                installation_id=payload.get("_installation_id")
                 if gh.identity_mode == "installation"
                 else None,
-                allowed_repositories="all",
+                allowed_repositories=str(payload.get("_repository_selection") or "all"),
+                permission_snapshot=dict(payload.get("_permissions") or {}),
                 credential_backend=str(credential.get("backend", "gh_cli")),
             )
             upsert(
@@ -402,22 +405,52 @@ class InventorySync:
         is also more honest than asking for org membership: it reports the accounts
         the App was actually granted, not the accounts the human belongs to.
         """
+        # The App is the authority on where it is installed. One listing per
+        # installation; the personal account and the company org are separate
+        # installations with separate tokens, and a sweep must reach both.
         try:
-            repos = list(gh.installation_repos())
+            installs = self.core.broker.installations()
         except Exception as exc:
-            self._record_error("<installation>", exc, errors, credential)
-            return []
+            self._record_error("<installations>", exc, errors, credential)
+            installs = []
+        if not installs and self.core.cfg.credentials.installation_id:
+            installs = [{"id": int(self.core.cfg.credentials.installation_id), "login": None, "type": None}]
 
         seen: dict[str, tuple[dict[str, Any], str]] = {}
-        for repo in repos:
-            owner = repo.get("owner") or {}
-            login = owner.get("login")
-            if not login or login in seen:
+        all_repos: list[dict[str, Any]] = []
+        for inst in installs:
+            inst_id = int(inst["id"])
+            try:
+                with self.core.client(TokenScope.READ_METADATA, reason="installation discovery",
+                                      installation_id=inst_id) as igh:
+                    repos = list(igh.installation_repos())
+            except Exception as exc:
+                self._record_error(f"<installation {inst_id}>", exc, errors, credential)
                 continue
-            kind = "organization" if owner.get("type") == "Organization" else "user"
-            seen[login] = (owner, kind)
-        # Cache so the repository sweep does not pay for the same listing twice.
-        self._installation_repo_cache = repos
+            for repo in repos:
+                repo["_installation_id"] = inst_id
+                all_repos.append(repo)
+                owner = repo.get("owner") or {}
+                login = owner.get("login")
+                if not login or login in seen:
+                    continue
+                kind = "organization" if owner.get("type") == "Organization" else "user"
+                payload = dict(owner)
+                payload["_installation_id"] = inst_id
+                payload["_repository_selection"] = inst.get("repository_selection")
+                payload["_permissions"] = inst.get("permissions") or {}
+                seen[login] = (payload, kind)
+            # An installation with zero repositories (a brand-new org) is still an
+            # account under governance: record it from the installation itself.
+            if inst.get("login") and inst["login"] not in seen:
+                payload = {"id": inst.get("account_id") or inst_id, "login": inst["login"],
+                           "_installation_id": inst_id,
+                           "_repository_selection": inst.get("repository_selection"),
+                           "_permissions": inst.get("permissions") or {}}
+                kind = "organization" if inst.get("type") == "Organization" else "user"
+                seen[inst["login"]] = (payload, kind)
+        # Cache so the repository sweep does not pay for the same listings twice.
+        self._installation_repo_cache = all_repos
         return list(seen.values())
 
     def _reconcile_presence(self, seen: set[str]) -> list[str]:

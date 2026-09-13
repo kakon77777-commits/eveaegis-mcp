@@ -29,6 +29,7 @@ class FakeBroker(CredentialBroker):
         lifetime_seconds: int,
         repositories: tuple[str, ...],
         reason: str,
+        installation_id: int | None = None,
     ) -> Grant:
         self.mint_calls.append((scope, reason))
         return Grant(

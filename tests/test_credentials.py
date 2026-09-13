@@ -81,7 +81,7 @@ class NoisyBroker(CredentialBroker):
     name = "noisy"
     max_scope = TokenScope.ADMIN
 
-    def _mint(self, scope, lifetime_seconds, repositories, reason):  # type: ignore[no-untyped-def]
+    def _mint(self, scope, lifetime_seconds, repositories, reason, installation_id=None):  # type: ignore[no-untyped-def]
         return Grant(
             scope=scope,
             expires_at=datetime.now(timezone.utc) + timedelta(days=30),

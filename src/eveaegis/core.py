@@ -102,6 +102,7 @@ class GovernanceCore:
         scope: TokenScope = TokenScope.READ_METADATA,
         *,
         reason: str = "governance read",
+        installation_id: int | None = None,
     ) -> GitHubClient:
         """Build a GitHub client bound to the broker.
 
@@ -116,7 +117,33 @@ class GovernanceCore:
             raise PermissionError(
                 f"governance.read_only is set; refusing to mint scope '{scope}'"
             )
-        return GitHubClient(self.broker, self.cfg.github, scope=scope, reason=reason)
+        return GitHubClient(
+            self.broker, self.cfg.github, scope=scope, reason=reason, installation_id=installation_id
+        )
+
+    def installation_for(self, full_name: str) -> int | None:
+        """The App installation that covers a repository, by its owner login.
+
+        ``None`` when the owner is not in ``github_installations`` yet, or under a
+        user token where installations do not exist — the broker then uses its
+        default, which is the right behaviour for a single-account setup.
+        """
+        owner = full_name.split("/", 1)[0].lower()
+        row = self.conn.execute(
+            "SELECT installation_id FROM github_installations WHERE tenant_id = ? AND lower(account_login) = ?",
+            (self.tenant_id, owner),
+        ).fetchone()
+        return int(row["installation_id"]) if row and row["installation_id"] else None
+
+    def client_for(
+        self,
+        full_name: str,
+        scope: TokenScope = TokenScope.READ_METADATA,
+        *,
+        reason: str = "governance read",
+    ) -> GitHubClient:
+        """A client minted for whichever installation owns ``full_name``."""
+        return self.client(scope, reason=reason, installation_id=self.installation_for(full_name))
 
     def workspace_for(self, repository_id: str) -> Path:
         """§21 — isolated per-repository analysis directory.

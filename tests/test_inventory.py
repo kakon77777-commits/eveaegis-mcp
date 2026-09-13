@@ -792,9 +792,18 @@ class TestInstallationModeDiscovery:
             **kw,
         )
 
+    @staticmethod
+    def _one_installation(core: GovernanceCore, installation_id: int = 153) -> None:
+        """The App reports where it is installed; the fake broker must too."""
+        core.broker.installations = lambda: [  # type: ignore[method-assign]
+            {"id": installation_id, "login": "octo", "type": "User", "account_id": 100,
+             "repository_selection": "all", "permissions": {"metadata": "read"}}
+        ]
+
     def test_installation_sweep_never_touches_user_endpoints(
         self, core: GovernanceCore
     ) -> None:
+        self._one_installation(core)
         bind(core, self._client(installation_repos=[repo_payload()]))
         result = InventorySync(core).sync_repositories(
             include_readme=False, include_languages=False, include_tree=False
@@ -806,6 +815,7 @@ class TestInstallationModeDiscovery:
         self, core: GovernanceCore
     ) -> None:
         """Not from org membership: report what the App was granted, not who he is."""
+        self._one_installation(core)
         bind(
             core,
             self._client(
@@ -826,12 +836,13 @@ class TestInstallationModeDiscovery:
         assert {i.account_type for i in installs} == {"user", "organization"}
         # The installation id is recorded now, unlike the delegated-token path.
         rows = core.conn.execute("SELECT DISTINCT installation_id FROM github_installations")
-        assert {r["installation_id"] for r in rows} == {core.cfg.credentials.installation_id}
+        assert {r["installation_id"] for r in rows} == {153}
 
     def test_the_listing_is_fetched_once_not_per_account(
         self, core: GovernanceCore
     ) -> None:
-        """One endpoint already spans every account; fanning out would re-pay for it."""
+        """One listing per installation; the sweep reuses it instead of re-paying."""
+        self._one_installation(core)
         client = bind(
             core,
             self._client(
@@ -855,6 +866,7 @@ class TestInstallationModeDiscovery:
     def test_installation_failure_is_reported_not_silently_empty(
         self, core: GovernanceCore
     ) -> None:
+        self._one_installation(core)
         bind(
             core,
             FakeGitHubClient(
@@ -953,3 +965,45 @@ class TestPresenceReconciliation:
         assert result.errors  # the failure is reported
         assert result.missing == []  # and nothing is declared gone
         assert core.conn.execute("SELECT COUNT(*) n FROM repositories WHERE missing_since IS NOT NULL").fetchone()["n"] == 0
+
+
+def test_two_installations_are_both_swept(core: GovernanceCore) -> None:
+    """Personal account + company org: two installations, two listings, one catalog."""
+    core.broker.installations = lambda: [  # type: ignore[method-assign]
+        {"id": 1, "login": "octo", "type": "User", "account_id": 100, "repository_selection": "all", "permissions": {}},
+        {"id": 2, "login": "EveMissLab", "type": "Organization", "account_id": 900, "repository_selection": "all", "permissions": {"contents": "write"}},
+    ]
+    personal = repo_payload()
+    company = repo_payload(owner_id=900, owner_login="EveMissLab", repo_id=901, name="corp",
+                           owner={"id": 900, "login": "EveMissLab", "type": "Organization"})
+    listings = {1: [personal], 2: [company]}
+
+    class PerInstallationClient(FakeGitHubClient):
+        def __init__(self, installation_id: int | None) -> None:
+            super().__init__(identity_mode="installation", installation_repos=listings.get(installation_id or 0, []))
+
+    core.client = lambda *a, **k: PerInstallationClient(k.get("installation_id"))  # type: ignore[method-assign]
+    result = InventorySync(core).sync_repositories(include_readme=False, include_languages=False, include_tree=False)
+
+    assert result.errors == []
+    assert result.repositories == 2
+    rows = {r["account_login"]: r for r in core.conn.execute("SELECT * FROM github_installations")}
+    assert rows["octo"]["installation_id"] == 1
+    assert rows["EveMissLab"]["installation_id"] == 2
+    assert rows["EveMissLab"]["account_type"] == "organization"
+    assert core.installation_for("EveMissLab/corp") == 2
+    assert core.installation_for("octo/alpha") == 1
+
+
+def test_an_empty_new_org_is_still_recorded(core: GovernanceCore) -> None:
+    """A brand-new org has no repositories yet but is already an account under governance."""
+    core.broker.installations = lambda: [  # type: ignore[method-assign]
+        {"id": 1, "login": "octo", "type": "User", "account_id": 100, "repository_selection": "all", "permissions": {}},
+        {"id": 2, "login": "EveMissLab", "type": "Organization", "account_id": 900, "repository_selection": "all", "permissions": {}},
+    ]
+    core.client = lambda *a, **k: FakeGitHubClient(  # type: ignore[method-assign]
+        identity_mode="installation", installation_repos=[repo_payload()] if k.get("installation_id") == 1 else []
+    )
+    InventorySync(core).sync_repositories(include_readme=False, include_languages=False, include_tree=False)
+    rows = {r["account_login"]: r for r in core.conn.execute("SELECT * FROM github_installations")}
+    assert "EveMissLab" in rows and rows["EveMissLab"]["installation_id"] == 2

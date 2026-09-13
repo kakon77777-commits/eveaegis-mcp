@@ -295,7 +295,7 @@ class ProvenanceEngine:
 
     def analyze(self, full_name: str, *, deep: bool = False) -> OriginProfile:
         """Run §22's fourteen-step determination flow for one repository."""
-        with self.core.client(TokenScope.READ_CONTENT, reason=f"provenance analysis of {full_name}") as client:
+        with self.core.client_for(full_name, TokenScope.READ_CONTENT, reason=f"provenance analysis of {full_name}") as client:
             bundle = self._gather(client, full_name, deep=deep)
         facts = self.build_facts(bundle)
         evaluation = evaluate_rules(self.rules, facts)
